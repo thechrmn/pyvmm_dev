@@ -34,6 +34,17 @@ def _has_alias(path: Path) -> bool:
     return any(_is_link(part) for part in (path, *path.parents))
 
 
+def file_identity(observed: os.stat_result) -> dict:
+    """The source snapshot shared by import records and extraction checks."""
+    return {
+        "size_bytes": observed.st_size,
+        "mtime_ns": observed.st_mtime_ns,
+        "ctime_ns": observed.st_ctime_ns,
+        "device_id": observed.st_dev,
+        "inode": observed.st_ino,
+    }
+
+
 def fingerprint_file(path: Path, relative_path: str) -> dict:
     """Hash a regular file with constant memory; reject observable concurrent writes."""
     path = Path(path).expanduser().absolute()
@@ -86,11 +97,7 @@ def fingerprint_file(path: Path, relative_path: str) -> dict:
     return {
         "path": str(path),
         "relative_path": relative_path,
-        "size_bytes": current.st_size,
-        "mtime_ns": current.st_mtime_ns,
-        "ctime_ns": current.st_ctime_ns,
-        "device_id": current.st_dev,
-        "inode": current.st_ino,
+        **file_identity(current),
         "sha256": digest.hexdigest(),
     }
 

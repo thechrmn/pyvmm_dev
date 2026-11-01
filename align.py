@@ -3,6 +3,7 @@
 Each video receives a file-centric VTADataset view. A SHA-256 identifier is a
 fallback identifier for that view, not a claim that a video is an entire study.
 Scientific context and the dataset's licence must be supplied by the researcher.
+Acquisition timing must come from experimental context, not file playback.
 """
 
 from __future__ import annotations
@@ -16,8 +17,6 @@ import stat
 from collections.abc import Iterator
 from copy import deepcopy
 from datetime import date, datetime
-from decimal import Decimal, InvalidOperation, localcontext
-from fractions import Fraction
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -180,10 +179,10 @@ def schema_provenance() -> dict:
 
 
 _ACQUISITION = "hardware_and_acquisition.acquisition"
+# Encoded playback timing cannot establish capture timing, e.g. in time-lapse video.
 _DIRECT_FIELDS = {
     "width": "video_resolution_width",
     "height": "video_resolution_height",
-    "frame_rate": "frame_rate",
     "frame_count": "total_frame_count",
     "bit_depth": "bit_depth",
     "color_mode": "color_mode",
@@ -473,97 +472,7 @@ def _temporal_errors(bestmeta: dict) -> Iterator[dict]:
             }
 
 
-def _duration(value: Any) -> str:
-    if isinstance(value, bool):
-        raise ValueError("A duration cannot be a boolean.")
-    try:
-        seconds = Decimal(str(value))
-    except (InvalidOperation, ValueError) as error:
-        raise ValueError("Duration must be a finite nonnegative number.") from error
-    if not seconds.is_finite() or seconds < 0:
-        raise ValueError("Duration must be a finite nonnegative number.")
-    rendered = "0" if seconds.is_zero() else format(seconds, "f")
-    if "." in rendered:
-        rendered = rendered.rstrip("0").rstrip(".")
-    return f"PT{rendered}S"
-
-
-def _exact_duration(value: str) -> str | None:
-    """Use an exact decimal only when the rational's expansion terminates."""
-    if (
-        not isinstance(value, str)
-        or len(value) > 1024
-        or re.fullmatch(r"\d+(?:/\d+)?", value, re.ASCII) is None
-    ):
-        raise ValueError("Invalid exact duration rational.")
-    try:
-        seconds = Fraction(value)
-    except (ValueError, ZeroDivisionError) as error:
-        raise ValueError("Invalid exact duration rational.") from error
-    denominator = seconds.denominator
-    powers = []
-    for factor in (2, 5):
-        count = 0
-        while denominator % factor == 0:
-            denominator //= factor
-            count += 1
-        powers.append(count)
-    if denominator != 1:
-        return None  # Keep the shortest float projection and original rational.
-    with localcontext() as context:
-        context.prec = len(str(seconds.numerator)) + max(powers) + 1
-        return _duration(Decimal(seconds.numerator) / Decimal(seconds.denominator))
-
-
-def _elapsed_duration(value: Any) -> Fraction | None:
-    """Compare fixed elapsed ISO durations without calendar/month assumptions."""
-    if not isinstance(value, str) or len(value) > 128:
-        return None
-    match = re.fullmatch(
-        r"P(?:(\d+)W)?(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?)?",
-        value,
-        re.ASCII,
-    )
-    if match is None or not any(part is not None for part in match.groups()):
-        return None
-    weeks, days, hours, minutes, seconds = (Fraction(part or "0") for part in match.groups())
-    return weeks * 604800 + days * 86400 + hours * 3600 + minutes * 60 + seconds
-
-
-def _set(data: dict, path: str, value: Any) -> None:
-    parts = path.split(".")
-    for part in parts[:-1]:
-        data = data.setdefault(part, {})
-    data[parts[-1]] = deepcopy(value)
-
-
-def _equal(left: Any, right: Any, path: str = "") -> bool:
-    # JSON bools must never compare equal to scientific integer measurements.
-    if isinstance(left, bool) != isinstance(right, bool):
-        return False
-    if path == f"{_ACQUISITION}.recording_duration":
-        left_duration, right_duration = (
-            _elapsed_duration(left),
-            _elapsed_duration(right),
-        )
-        if left_duration is not None and right_duration is not None:
-            return left_duration == right_duration
-    return left == right
-
-
 _MP4_BRANDS = frozenset("isom iso2 iso3 iso4 iso5 iso6 iso7 iso8 iso9 mp41 mp42 avc1 M4V".split())
-
-
-def _duration_observation(technical: dict) -> tuple:
-    rational = technical.get("duration_rational")
-    exact = _exact_duration(rational) if rational is not None else None
-    if exact is not None:
-        return exact, "technical.duration_rational", "exact_rational_seconds_to_ISO8601_duration"
-    return (
-        _duration(technical["duration_seconds"]),
-        "technical.duration_seconds",
-        "seconds_to_ISO8601_duration",
-    )
 
 
 def _container_observation(extraction: dict) -> tuple:
@@ -583,7 +492,7 @@ def _container_observation(extraction: dict) -> tuple:
 
 
 def _measurements(extraction: dict, issues: list) -> Iterator[tuple]:
-    """Project only justified measurements, retaining their source and method."""
+    """Project file properties; capture timing requires researcher-supplied context."""
     technical = extraction.get("technical", {})
     digest = extraction.get("asset", {}).get("sha256")
     if isinstance(digest, str) and re.fullmatch(r"[a-fA-F0-9]{64}", digest):
@@ -600,13 +509,6 @@ def _measurements(extraction: dict, issues: list) -> Iterator[tuple]:
                 technical[source],
                 f"technical.{source}",
                 "direct",
-            )
-    if technical.get("duration_seconds") is not None:
-        try:
-            yield f"{_ACQUISITION}.recording_duration", *_duration_observation(technical)
-        except ValueError as error:
-            issues.append(
-                _issue("invalid_duration", str(error), value=repr(technical["duration_seconds"]))
             )
     codec = technical.get("codec")
     if isinstance(codec, str) and codec:
@@ -661,7 +563,11 @@ class _Alignment:
         self.issues = deepcopy(issues)
 
     def measure(self, path: str, value: Any, source: str, method: str) -> None:
-        _set(self.bestmeta, path, value)
+        destination = self.bestmeta
+        parts = path.split(".")
+        for part in parts[:-1]:
+            destination = destination.setdefault(part, {})
+        destination[parts[-1]] = deepcopy(value)
         self.provenance[path] = [_evidence("extracted", source, value, method)]
 
     def _conflict(self, path: str, existing: Any, candidate: Any, history: list) -> None:
@@ -694,10 +600,14 @@ class _Alignment:
             path = _path((*prefix, key))
             history = self.provenance.setdefault(path, [])
             evidence = _evidence("annotation", path, candidate, "researcher_supplied")
+            # JSON bools must never compare equal to scientific integer measurements.
             conflict = (
                 key in destination
                 and path != "dataset_id"
-                and not _equal(existing, candidate, path)
+                and not (
+                    isinstance(existing, bool) == isinstance(candidate, bool)
+                    and existing == candidate
+                )
             )
             if conflict:
                 self._conflict(path, existing, candidate, history)

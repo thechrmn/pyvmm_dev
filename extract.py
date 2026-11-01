@@ -11,6 +11,7 @@ import stat
 import subprocess
 import time
 from fractions import Fraction
+from importlib import import_module
 from pathlib import Path
 from typing import Any
 
@@ -20,13 +21,7 @@ SUPPORTED_DEMUXERS = tuple(
     "3g2 3gp aac asf avi flv h264 hevc m4a m4v matroska mj2 mjpeg mov mp3 mp4 "
     "mpeg mpegts mpegvideo mxf nut ogg wav webm".split()
 )
-_STAT_FIELDS = {
-    "size_bytes": "st_size",
-    "mtime_ns": "st_mtime_ns",
-    "device_id": "st_dev",
-    "inode": "st_ino",
-    "ctime_ns": "st_ctime_ns",
-}
+file_identity = import_module("import").file_identity
 
 
 class ProbeFailure(Exception):
@@ -390,17 +385,13 @@ def _technical(raw: dict, issues: list[dict]) -> dict:
     return result
 
 
-def _identity(observed):
-    return {key: getattr(observed, attribute) for key, attribute in _STAT_FIELDS.items()}
-
-
 def _source(asset, issues):
     try:
         path = Path(asset["path"]).resolve(strict=True)
         observed = path.stat()
         if not stat.S_ISREG(observed.st_mode):
             raise OSError("Input is not a regular file")
-        if any(asset.get(key, value) != value for key, value in _identity(observed).items()):
+        if any(asset.get(key, value) != value for key, value in file_identity(observed).items()):
             _issue(
                 issues,
                 "input_changed",
@@ -417,7 +408,7 @@ def _source(asset, issues):
 def _check_source(path, before, issues):
     try:
         after = path.stat()
-        if not stat.S_ISREG(after.st_mode) or _identity(before) != _identity(after):
+        if not stat.S_ISREG(after.st_mode) or file_identity(before) != file_identity(after):
             _issue(
                 issues,
                 "input_changed",

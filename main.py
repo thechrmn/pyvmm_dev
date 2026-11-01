@@ -57,13 +57,11 @@ def main(argv=None):
         metadata = validate_annotations(metadata)
         probe_info = inspect_ffprobe(args.ffprobe)
         tool = probe_info["executable"]
-        assets, issues = import_files(args.inputs, exclude_paths=[args.output])
-
-        records = (
-            align_metadata(extract_metadata(asset, ffprobe=tool), metadata) for asset in assets
-        )
-
         run_info = {
+            "pipeline_sources": {
+                name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
+                for name in ("main.py", "import.py", "extract.py", "align.py", "export.py")
+            },
             "python": platform.python_version(),
             "libraries": {
                 name: package_metadata.version(name)
@@ -75,6 +73,10 @@ def main(argv=None):
                 "canonical_json_sha256": annotation_hash,
             },
         }
+        assets, issues = import_files(args.inputs, exclude_paths=[args.output])
+        records = (
+            align_metadata(extract_metadata(asset, ffprobe=tool), metadata) for asset in assets
+        )
         summary = export_metadata(
             records,
             args.output,

@@ -83,6 +83,11 @@ Conditional alternatives may be reported: choose the scientifically applicable
 branch. Hardware lives under `hardware_and_acquisition.hardware`; acquisition
 settings live under `hardware_and_acquisition.acquisition`. Timestamps need an
 explicit UTC offset or `Z`. Custom information belongs in `annotations`.
+Supply acquisition `frame_rate` and `recording_duration` from experimental context.
+The file's encoded playback rate and duration cannot establish capture timing:
+time-lapse, slow-motion, and edited recordings can have different time scales.
+These file measurements remain in `extraction.technical`; they are not automatically
+promoted to acquisition facts. Unknown acquisition timing correctly remains a draft.
 
 ```powershell
 $metadata = 'D:\your\study.json'
@@ -147,7 +152,13 @@ the wrapper's consistency, not the independent truth of FFprobe's measurements.
 The original selected stream and all other streams remain in `extraction.raw`.
 Multiple video streams select the default, then lowest index, with a warning.
 
-Use exact `frame_rate_rational` and `duration_rational` when precision matters.
+Use exact `frame_rate_rational` and `duration_rational` for file playback timing.
+They do not calibrate elapsed experimental time. For example, the
+[published Vibrio movie](https://journals.plos.org/plosbiology/article?id=10.1371/journal.pbio.1002517)
+was acquired at 1 FPS but its downloaded AVI plays at 10 FPS. Researcher-supplied
+capture timing is therefore independent of file playback timing and is accepted
+without a false conflict. Conflicts with actual file measurements such as width
+remain errors. Acquisition duration is never guessed from frame count and rate.
 Unknown frame counts remain absent: even a valid MKV can omit them. No count is
 inferred from rate × duration. Container/filesystem creation time and encoder
 name are not evidence of recording time or acquisition software. A multi-stream
@@ -181,7 +192,7 @@ See [FFmpeg's error handling](https://ffmpeg.org/ffmpeg.html#Advanced-options).
 | --- | --- | --- |
 | Import | `pathlib`, `os`, `stat`, `hashlib`; content probing in extraction | `python-magic` classifies headers but cannot establish video integrity. A second format gate adds no demonstrated benefit here. |
 | Extraction | Native FFprobe through bounded `subprocess` | PyAV for direct decoding; MediaInfo for independent inspection. Hachoir exposed less timing and tag detail in the tested corpus. |
-| Alignment and validation | Explicit Python mapping, `Fraction`/`Decimal`, pinned BeStMeta JSON Schema, `jsonschema`, explicit RFC checks | LinkML for schema authoring/upgrades. Pydantic needs strict configuration and another model representation; `linkml-map` adds an evolving transformation language. |
+| Alignment and validation | Explicit Python mapping, pinned BeStMeta JSON Schema, `jsonschema`, explicit RFC checks | LinkML for schema authoring/upgrades. Pydantic needs strict configuration and another model representation; `linkml-map` adds an evolving transformation language. |
 | Export | `json`, `csv`, and native filesystem APIs | pandas/Pandera suit tabular analysis; LinkML serializers/RDFlib suit additional semantic formats. Neither is needed for the two required outputs. |
 
 On 2026-10-31, FFprobe 9.0.2, PyAV 16.1.0, pymediainfo 7.0.1, and Hachoir 3.4.0
@@ -233,13 +244,46 @@ For CZI, ND2, OME-TIFF, or other microscopy formats outside this pipeline's scop
 Bio-Formats is a separate candidate. Those readers were not tested without
 representative microscopy files. No claim of proprietary-format support is made.
 
+## Scientific validation and proposal coverage
+
+On 2026-11-01, ten unchanged public scientific recordings were tested from PLOS,
+eLife, Nature/PhotoniX, and NASA: fish behaviour, echocardiography, gut microscopy,
+droplet experiments, and solar observations. The 89,056,190-byte corpus covers
+MP4, MOV, AVI, and WebM; H.264, MPEG-4, MJPEG, VP8, and raw BGR video. All ten
+selected video streams fully decoded, totalling 9,341 frames. Every available
+header frame count agreed with decoding; WebM's absent count remained absent.
+Original SHA-256 hashes remained unchanged. These are bounded corpus results,
+not a claim of universal scientific-format or corruption detection coverage.
+
+The public recordings exposed the capture/playback distinction above, including
+[48 Hz heart acquisition versus 30 FPS playback](https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0115604)
+and [1000 FPS droplet acquisition versus 10 FPS playback](https://www.nature.com/articles/ncomms3517).
+The pipeline retains exact file timing and accepts independently sourced capture
+timing without conflating the two. Missing study facts are never fabricated to
+make a public example pass BeStMeta validation.
+
+The four-page proposal describes a larger project than this nine-file core:
+
+| Proposal requirement | Current implementation |
+| --- | --- |
+| WP1: library comparison and BeStMeta requirements | Candidate assessment above; pinned schema and scientific validation. Proprietary microscopy readers remain unvalidated. |
+| WP2: reusable extraction, enrichment, CSV/JSON export | Four stage functions and CLI; annotations remain linked artifacts identified by source hashes, rather than rewritten video tags. |
+| WP2: comprehensive metadata access | All data in the configured FFprobe format, stream, chapter, program, and version sections are retained. Stream-group, packet/frame metadata and proprietary tags are not promised. |
+| WP2: released Python package, GitHub, CI, DOI | Not delivered: this is a local script core. Automated QA was run externally; no package release, hosted CI, public repository, or DOI was created. |
+| WP3: public scientific validation and tutorial | Public corpus, full-decode/reference checks, failure stress tests, and usage instructions; partner/private datasets were unavailable. |
+| WP3: Galaxy XML, workflow and Tool Shed release | Not implemented in this minimal core. The broader proposal is therefore not fully delivered. |
+
 ## Scope and reproducibility
 
 `main.py` calls only `import.py`, `extract.py`, `align.py`, and `export.py`.
+Import owns the file-identity snapshot shared with extraction. The only dependency
+between stages is `extract.py` → `import.py`; the module graph remains acyclic.
+Alignment keeps measurement writes, provenance, and conflict decisions together.
 FFprobe is the sole media backend. `jsonschema` and the two explicit RFC format
 validators check the unmodified BeStMeta draft 0.1.0 schema at revision
 `6bf77e27fe274481c06ee9e4b52e2befdcdb36d7`; its canonical hash is checked offline.
-Schema identity, Python/library/tool versions, annotation hash, raw extraction,
+Schema identity, hashes of the five pipeline scripts, Python/library/tool versions,
+annotation hash, raw extraction,
 provenance, conflicts, and findings are retained in authoritative `metadata.json`.
 CSV is a viewing format: formula-like text is escaped; arrays remain JSON;
 literal `.`/`~` in keys become `~1`/`~0`. See `LICENSE` for attribution.
