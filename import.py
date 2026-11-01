@@ -27,7 +27,9 @@ def _is_link(path: Path) -> bool:
         return False
     # The junction tag also works on Python 3.11 without rejecting OneDrive's
     # cloud-placeholder reparse points. One lstat handles both alias types.
-    return stat.S_ISLNK(observed.st_mode) or getattr(observed, "st_reparse_tag", None) == 0xA0000003
+    return (
+        stat.S_ISLNK(observed.st_mode) or getattr(observed, "st_reparse_tag", None) == 0xA0000003
+    )
 
 
 def _has_alias(path: Path) -> bool:

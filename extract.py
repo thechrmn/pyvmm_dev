@@ -21,13 +21,15 @@ SUPPORTED_DEMUXERS = tuple(
     "3g2 3gp aac asf avi flv h264 hevc m4a m4v matroska mj2 mjpeg mov mp3 mp4 "
     "mpeg mpegts mpegvideo mxf nut ogg wav webm".split()
 )
-file_identity = import_module("import").file_identity
+_import_stage = import_module(f"{__package__}.import" if __package__ else "import")
+file_identity = _import_stage.file_identity
 
 
 class ProbeFailure(Exception):
     """A failed or resource-bounded external probe."""
 
     def __init__(self, code: str, message: str):
+        """Initialize a failure with a machine-readable code and diagnostic."""
         super().__init__(message)
         self.code = code
 
@@ -189,6 +191,9 @@ def inspect_ffprobe(ffprobe: str = "ffprobe", *, timeout: float = 10) -> dict:
         "executable": executable,
         "version": match.group(1),
         "banner": banner[0],
+        "sha256": _import_stage.fingerprint_file(Path(executable), Path(executable).name)[
+            "sha256"
+        ],
     }
 
 
@@ -311,7 +316,8 @@ def _duration(stream, format_data, streams, issues):
             return result
         result["container_duration_seconds"] = float(container)
         timed = sum(
-            s.get("codec_type") != "attachment" and not s.get("disposition", {}).get("attached_pic")
+            s.get("codec_type") != "attachment"
+            and not s.get("disposition", {}).get("attached_pic")
             for s in streams
         )
         if timed != 1:
@@ -417,7 +423,10 @@ def _check_source(path, before, issues):
             )
     except OSError as error:
         _issue(
-            issues, "input_changed", f"Input became unavailable during extraction: {error}", "error"
+            issues,
+            "input_changed",
+            f"Input became unavailable during extraction: {error}",
+            "error",
         )
 
 

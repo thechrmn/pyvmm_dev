@@ -4,6 +4,9 @@ Local video import → FFprobe extraction → BeStMeta alignment → JSON/CSV ex
 Python 3.11+, the three pinned Python dependencies, and a native FFprobe executable
 are required. Windows and Linux publication are supported.
 
+The project contains five pipeline scripts, one pinned schema, requirements,
+licence, this guide, and one portable regression-test module.
+
 ## 1. Install once
 
 Open PowerShell in this project folder. Install Python 3.11 or newer and obtain
@@ -20,7 +23,7 @@ $ffprobe = 'C:\tools\ffmpeg\bin\ffprobe.exe'
 & $python -B .\main.py --help
 ```
 
-The environment stays outside the nine project files. In a new PowerShell session,
+The environment stays outside the project files. In a new PowerShell session,
 set `$python` and `$ffprobe` again. On Linux, create a virtual environment outside
 the project, install `requirements.txt`, and use its Python with the same CLI.
 
@@ -105,7 +108,7 @@ SHA-256 identifier. Each record is a file-centric BeStMeta view, not a merged st
 ## 4. Check the results locally
 
 Run this in the same PowerShell session after either run. It independently checks
-the exported source hashes, JSON/CSV row agreement, and summary counts, and prints
+the exported source hashes, CSV hash/validity columns, and summary counts, and prints
 all per-record findings. It reads every input again, so allow time for large files.
 This check loads the output JSON into memory; use manageable batches for large datasets.
 
@@ -139,7 +142,7 @@ for record, row in zip(records, rows):
         print(name, json.dumps(record[name], ensure_ascii=True))
 print("import_issues", json.dumps(document["import_issues"]))
 print("summary", json.dumps(summary))
-print("PASS: hashes, row agreement, and counts; review scientific findings above")
+print("PASS: hashes, CSV validity, and counts; review scientific findings above")
 '@ | & $python -B - "$results"
 if ($LASTEXITCODE -ne 0) { throw 'Output verification failed' }
 ```
@@ -185,6 +188,131 @@ if ($LASTEXITCODE -ne 0) { throw 'Video decoding failed' }
 
 This checks decoding of the video streams, not the truth of acquisition metadata.
 See [FFmpeg's error handling](https://ffmpeg.org/ffmpeg.html#Advanced-options).
+
+## Full pipeline logic
+
+```mermaid
+flowchart TD
+    A[CLI and configuration checks] --> B[Discover and fingerprint all readable inputs]
+    B --> C[Create private output staging directory]
+    C --> D[Extract one file with bounded FFprobe]
+    D --> E[Align evidence and researcher context]
+    E --> F[Validate and stream record to JSON and CSV row spool]
+    F -->|More files| D
+    F -->|All files processed| G[Finish JSON and write CSV; sync both files]
+    G --> H[Atomically publish new output directory]
+```
+
+1. **Preflight — `main.py`.** Parse inputs, new output path, optional metadata,
+   and FFprobe path. Reject an existing destination, verify the pinned schema,
+   read and check the annotation envelope, then inspect FFprobe. Record schema,
+   source-code and annotation identities plus Python, dependency and tool versions.
+   Schema, annotation-envelope and backend configuration errors stop before video
+   hashing. Destination creation and write permissions are checked when staging
+   begins.
+2. **Import — `import.py`.** Discover local paths deterministically. Directory
+   searches use the suffix allowlist; explicit files go to content probing
+   regardless of suffix. Skip symlinks/junctions and the output subtree. Deduplicate
+   repeated paths; retain equal-content files at different paths. Hash each regular
+   file with bounded memory and before/after identity checks. Collect failures
+   beside successful assets. All discovery and hashing finish before extraction.
+3. **Extract — `extract.py`.** Check the imported file identity, then run native
+   FFprobe with local-file/demuxer restrictions and time/output limits. Retain the
+   configured raw sections, command and diagnostics. Select a non-cover video
+   stream by default disposition, then lowest index. Read dimensions, codec,
+   pixel format, available header count and exact rational playback timing.
+   Recheck identity afterward. Operational failures become issues on that file;
+   unavailable values remain absent.
+4. **Align — `align.py`.** Create a SHA-based file-view identifier; map justified
+   file measurements and controlled codec/container values into BeStMeta. Merge
+   the shared researcher context. Preserve both candidates and provenance when
+   they conflict; only an explicit dataset ID may replace the generated identifier.
+   Keep acquisition timing independent of playback. Validate the pinned schema,
+   unknown fields, usable required values, physical ranges and timestamp ordering.
+   Return a valid record or a draft with actionable findings.
+5. **Export — `export.py`.** Drive extraction/alignment lazily, one file at a time.
+   Check record contracts, stream authoritative JSON, and spool flattened CSV rows
+   privately while collecting columns. Finish the summary, write escaped CSV,
+   close the spool and sync both outputs. Publish the staging directory atomically
+   only if the destination is still absent. A failed export removes staging;
+   an existing destination is preserved.
+6. **Result — `main.py`.** Print the summary and return the documented exit code.
+   Drafts and per-file input/probe errors are useful exported results (exit 1).
+   Configuration, infrastructure or export failures abort publication (exit 2);
+   interruption returns 130. Review import issues as well as record findings.
+
+The boundaries are ordinary dictionaries, with no global per-run mutable state:
+
+| Function | Input → output contract |
+| --- | --- |
+| `import_files(inputs, exclude_paths=...)` | Paths → `(assets, import_issues)`. Each asset carries absolute/relative paths, SHA-256 and the shared five-field file identity. |
+| `extract_metadata(asset, ffprobe=...)` | Imported asset → `asset`, `raw`, `technical`, `issues`, `tool`. |
+| `align_metadata(extraction, annotations)` | Extraction and optional context → `extraction`, `bestmeta`, custom `annotations`, `provenance`, `conflicts`, `issues`, `validation`. Inputs remain unmodified. |
+| `export_metadata(records, output, ...)` | Record iterable and run/import/schema information → published JSON/CSV and summary. Consume this only with trusted in-process records; the private spool is never an input format. |
+
+These functions are callable directly from Python. Because `import` is a Python
+keyword, load that stage with `importlib.import_module("import")`. The CLI remains
+the entry point that performs all configuration and reproducibility checks.
+
+## Maintaining and adapting the core
+
+Keep behavior in its owning stage and preserve the boundary fields above. A new
+technical field automatically reaches JSON and the flattened CSV; projecting it
+into BeStMeta requires an explicit, scientifically justified mapping.
+
+| Intended change | Smallest owning location |
+| --- | --- |
+| Folder-discovery suffixes | `import.py`: `VIDEO_EXTENSIONS` |
+| Source identity semantics | `import.py`: `file_identity`; extraction reuses it |
+| Probe format support or bounds | `extract.py`: `SUPPORTED_DEMUXERS`, `_run_bounded`, `extract_metadata` |
+| Technical measurements | `extract.py`: `_technical` and its timing helpers |
+| BeStMeta projection or vocabulary | `align.py`: `_DIRECT_FIELDS`, `_CODECS`, `_measurements`, `_container_observation` |
+| Scientific constraints | `align.py`: `_supplemental_errors`, `_numeric_error`, `_temporal_errors`, `_validate` |
+| Context merging, conflicts or evidence | `align.py`: `_Alignment` |
+| CSV presentation | `export.py`: `_row`, `_flatten`, `_csv_cell` |
+| Output transaction | `export.py`: `_staged_output`, `_publish` |
+| CLI and run provenance | `main.py`: `main` |
+
+Change one owner at a time. Preserve exact timing evidence, absence of unknown
+values, conflict history, source immutability and no-overwrite publication.
+Remove a mapping by removing its projection, while retaining the raw observation.
+For a schema upgrade, review the new schema, mappings and scientific constraints
+together; update the commit and canonical hash deliberately and compare outputs.
+For a backend upgrade, record the new version and rerun representative real files
+as well as the regression checks. Tests with a fake probe cannot establish a
+native backend's format support or scientific accuracy.
+
+The pinned schema's explicitly anchored identifiers, durations, versions and
+email patterns require complete values. Supplemental checks reject trailing
+newlines and enforce ASCII digit classes; Unicode and multiline free text remain
+supported. This follows the schema's
+[ECMA-262 regex dialect](https://json-schema.org/draft/2019-09/json-schema-core#rfc.section.6.4),
+whose [digit class means 0–9](https://tc39.es/ecma262/multipage/text-processing.html#sec-compiletocharset).
+Review these assumptions when changing the pinned schema.
+
+The single `test_pipeline.py` file retains portable regression checks using
+Python's standard-library `unittest`; no test dependency is required. From this
+folder, with the installed environment:
+
+```powershell
+$env:PYVMM_FFPROBE = $ffprobe
+& $python -B -m unittest -v test_pipeline
+if ($LASTEXITCODE -ne 0) { throw 'Pipeline regression checks failed' }
+```
+
+Setting `PYVMM_FFPROBE` also runs native invalid-video handling. Without it, that
+check skips; symlink creation skips if the OS denies permission. The other checks
+use a controlled probe response and exercise actual import, alignment and export,
+including valid/draft CLI outcomes, process limits, malformed scientific values,
+missing dependency information and rollback. If cleanup fails, the CLI preserves
+the original failure or interruption and reports the cleanup problem alongside it.
+
+Keep these checks with the source when sharing or versioning the pipeline. Add a
+regression for a real defect before fixing it, then run the checks and the local
+data-validation procedure above. Preserve independently known measurements for
+your representative recordings. Dependency and schema pins make upgrades explicit;
+they still need periodic compatibility/security review. No finite test set or
+architecture can guarantee every format or unlimited future compatibility.
 
 ## Library selection
 
@@ -262,14 +390,14 @@ The pipeline retains exact file timing and accepts independently sourced capture
 timing without conflating the two. Missing study facts are never fabricated to
 make a public example pass BeStMeta validation.
 
-The four-page proposal describes a larger project than this nine-file core:
+The four-page proposal describes a larger project than this minimal core:
 
 | Proposal requirement | Current implementation |
 | --- | --- |
 | WP1: library comparison and BeStMeta requirements | Candidate assessment above; pinned schema and scientific validation. Proprietary microscopy readers remain unvalidated. |
 | WP2: reusable extraction, enrichment, CSV/JSON export | Four stage functions and CLI; annotations remain linked artifacts identified by source hashes, rather than rewritten video tags. |
 | WP2: comprehensive metadata access | All data in the configured FFprobe format, stream, chapter, program, and version sections are retained. Stream-group, packet/frame metadata and proprietary tags are not promised. |
-| WP2: released Python package, GitHub, CI, DOI | Not delivered: this is a local script core. Automated QA was run externally; no package release, hosted CI, public repository, or DOI was created. |
+| WP2: released Python package, GitHub, CI, DOI | Local script core with portable regression checks and additional external QA. No package release, hosted CI, public repository, or DOI was created. |
 | WP3: public scientific validation and tutorial | Public corpus, full-decode/reference checks, failure stress tests, and usage instructions; partner/private datasets were unavailable. |
 | WP3: Galaxy XML, workflow and Tool Shed release | Not implemented in this minimal core. The broader proposal is therefore not fully delivered. |
 
@@ -289,7 +417,8 @@ CSV is a viewing format: formula-like text is escaped; arrays remain JSON;
 literal `.`/`~` in keys become `~1`/`~0`. See `LICENSE` for attribution.
 
 Default limits are 60 seconds and 16 MiB of combined probe output per recording;
-annotation JSON is limited to 16 MiB and 64 levels. Only supported self-contained
+annotation JSON is limited to 16 MiB and 64 levels. Probe limits bound elapsed time
+and captured output; they do not impose an OS-level RAM cap. Only supported self-contained
 local video formats are probed; playlists, image sequences, and remote protocols
 are excluded. Extraction does not perform a full decode/corruption scan, read
 proprietary microscopy formats, or synchronize clocks between recordings.

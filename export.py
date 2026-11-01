@@ -198,16 +198,14 @@ def _staged_output(output):
         yield staging
         _publish(staging, target)
     finally:
-        if staging.exists() and staging.parent == target.parent:
-            active_error = sys.exc_info()[1]
-            try:
+        active_error = sys.exc_info()[1]
+        try:
+            if staging.parent == target.parent and staging.exists():
                 shutil.rmtree(staging)
-            except OSError as cleanup_error:
-                if active_error is None:
-                    raise
-                active_error.add_note(
-                    f"Could not remove staging directory {staging}: {cleanup_error}"
-                )
+        except OSError as cleanup_error:
+            if active_error is None:
+                raise
+            active_error.add_note(f"Could not remove staging directory {staging}: {cleanup_error}")
 
 
 def export_metadata(records, output, *, import_issues=None, schema_info=None, run_info=None):

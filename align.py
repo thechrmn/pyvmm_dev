@@ -57,7 +57,11 @@ def _valid_datetime(value: Any) -> bool:
 
 @_FORMATS.checks("uri")
 def _valid_uri(value: Any) -> bool:
-    return not isinstance(value, str) or bool(validate_rfc3986(value, rule="URI"))
+    if not isinstance(value, str):
+        return True
+    match = validate_rfc3986(value, rule="URI")
+    # The dependency's regex can stop before a final newline; require all text.
+    return match is not None and match.end() == len(value)
 
 
 def _pairs(pairs: list[tuple[str, object]]) -> dict:
@@ -73,7 +77,19 @@ def _constant(value: str):
     raise ValueError(f"Non-finite JSON number: {value}")
 
 
+def _json_float(token: str) -> float:
+    value = float(token)
+    if not math.isfinite(value) or (
+        value == 0 and any(char in "123456789" for char in token.lower().partition("e")[0])
+    ):
+        raise ValueError(
+            "Out of range float: metadata numbers must be finite and cannot underflow to zero."
+        )
+    return value
+
+
 def read_json(path: str | Path) -> dict:
+    """Read bounded UTF-8 JSON, rejecting duplicate keys and lossy float extremes."""
     source = Path(path).expanduser()
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
     descriptor = os.open(source, flags)
@@ -94,7 +110,10 @@ def read_json(path: str | Path) -> dict:
     if len(content) > MAX_METADATA_BYTES:
         raise ValueError(f"Metadata file exceeds {MAX_METADATA_BYTES} bytes: {path}")
     content = json.loads(
-        content.decode("utf-8-sig"), object_pairs_hook=_pairs, parse_constant=_constant
+        content.decode("utf-8-sig"),
+        object_pairs_hook=_pairs,
+        parse_constant=_constant,
+        parse_float=_json_float,
     )
     if not isinstance(content, dict):
         raise ValueError(f"JSON root must be an object: {path}")
@@ -265,7 +284,9 @@ def _shape(schema: dict, root: dict) -> dict:
     return root["$defs"][reference.removeprefix("#/$defs/")] if reference else schema
 
 
-def _supplemental_errors(value: Any, schema: dict, root: dict, parts: tuple = ()) -> Iterator[dict]:
+def _supplemental_errors(
+    value: Any, schema: dict, root: dict, parts: tuple = ()
+) -> Iterator[dict]:
     """Catch unknown slots and scientific numeric constraints absent upstream."""
     shape = _shape(schema, root)
     if isinstance(value, dict):
@@ -285,14 +306,26 @@ def _supplemental_errors(value: Any, schema: dict, root: dict, parts: tuple = ()
         if isinstance(items, dict):
             for index, child in enumerate(value):
                 yield from _supplemental_errors(child, items, root, (*parts, index))
-    elif isinstance(value, str) and not value.strip() and "string" in _types(shape):
-        # Empty text is not useful scientific metadata, even where upstream
-        # permits it. Optional unknown values should be omitted or set to null.
-        yield {
-            "path": _path(parts),
-            "code": "empty_string",
-            "message": "Metadata strings must not be empty or whitespace-only.",
-        }
+    elif isinstance(value, str):
+        if not value.strip() and "string" in _types(shape):
+            yield {
+                "path": _path(parts),
+                "code": "empty_string",
+                "message": "Metadata strings must not be empty or whitespace-only.",
+            }
+        pattern = shape.get("pattern", "")
+        # Enforce whole values and ECMA-262 digit classes in the pinned patterns.
+        if (
+            pattern.startswith("^")
+            and pattern.endswith("$")
+            and re.fullmatch(pattern, value, re.ASCII) is None
+            and re.search(pattern, value) is not None
+        ):
+            yield {
+                "path": _path(parts),
+                "code": "scientific_pattern",
+                "message": "Use the complete value and ASCII digits required by the schema.",
+            }
     elif isinstance(value, (float, int)) and not isinstance(value, bool):
         error = _numeric_error(value, parts[-1] if parts else None)
         if error:
@@ -454,7 +487,11 @@ def _temporal_errors(bestmeta: dict) -> Iterator[dict]:
                 yield {
                     "path": path,
                     "code": "scientific_datetime_format",
-                    "message": "Use an RFC 3339 timestamp with an explicit UTC offset or Z; local clock times are ambiguous.",
+                    "message": (
+                        "Use an RFC 3339 timestamp with an explicit UTC offset or Z, "
+                        "a year from 0001 to 9999, and seconds from 00 to 59; "
+                        "leap seconds are unsupported."
+                    ),
                 }
             else:
                 # datetime truncates after microseconds; compare the original

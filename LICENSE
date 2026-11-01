@@ -1,3 +1,6 @@
+PyVMM-authored code and documentation: MIT License.
+The vendored BeStMeta schema is a separate third-party component; see below.
+
 MIT License
 
 Copyright (c) 2026 PyVMM contributors
@@ -21,7 +24,17 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 
-BeStMeta schema
+BeStMeta schema — LicenseRef-BeStMeta-Unresolved
+
+This identifier records an unresolved upstream licensing discrepancy; it is
+not a new licence grant. The pinned repository LICENSE and README describe
+MIT licensing for schema/code, while bestmeta_schema.yaml declares CC-BY-4.0
+in its header and licence field. Both notices and attribution are preserved.
+Obtain upstream clarification before asserting unqualified redistribution
+terms or publishing a release with a blanket MIT claim.
+
+The following MIT notice is reproduced from the pinned repository LICENSE:
+
 MIT License
 
 Copyright (c) 2026 Helmholtz Centre for Environmental Research – UFZ
