@@ -3,12 +3,10 @@
 __version__ = "0.1.0.dev0"
 
 import argparse
-import hashlib
 import importlib
 import json
 import os
 import sys
-from datetime import UTC, datetime
 from pathlib import Path
 
 
@@ -29,7 +27,6 @@ def main(argv: list[str] | None = None) -> int:
             align_metadata,
             load_schema,
             read_json,
-            schema_provenance,
             validate_annotations,
         )
         from export import export_metadata
@@ -40,31 +37,13 @@ def main(argv: list[str] | None = None) -> int:
             raise FileExistsError("Choose a new output folder.")
         # One schema snapshot per run; unavailable validation must not discard evidence.
         schema_context = load_schema(args.schema)
-        schema_info = schema_provenance(schema_context=schema_context)
-        metadata_path = args.metadata.expanduser() if args.metadata else None
-        metadata = read_json(metadata_path) if metadata_path else {}
-        annotation_hash = hashlib.sha256(
-            json.dumps(metadata, allow_nan=False, sort_keys=True, separators=(",", ":")).encode(
-                "utf-8"
-            )
-        ).hexdigest()
-        metadata = validate_annotations(metadata)
+        metadata = validate_annotations(read_json(args.metadata) if args.metadata else {})
         probe_info = inspect_ffprobe(args.ffprobe)
         tool = probe_info["executable"]
         run_info = {
             "software": {"name": "PyVMM", "version": __version__},
-            "started_at_utc": datetime.now(UTC).isoformat(),
-            "arguments": list(sys.argv[1:] if argv is None else argv),
-            "pipeline_sources": {
-                name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
-                for name in ("main.py", "import.py", "extract.py", "align.py", "export.py")
-            },
             "python": sys.version,
             "ffprobe": probe_info,
-            "annotation_input": {
-                "path": str(metadata_path.resolve()) if metadata_path else None,
-                "canonical_json_sha256": annotation_hash,
-            },
         }
         assets, issues = import_files(args.inputs, exclude_paths=[args.output])
         records = (
@@ -77,7 +56,7 @@ def main(argv: list[str] | None = None) -> int:
             records,
             args.output,
             import_issues=issues,
-            schema_info=schema_info,
+            schema_info=schema_context["provenance"],
             run_info=run_info,
         )
         print(json.dumps(summary))

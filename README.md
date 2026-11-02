@@ -1,8 +1,7 @@
 # PyVMM
 
-Extract metadata from local scientific videos, align known fields with
-[BeStMeta](https://github.com/Helmholtz-UFZ/BeStMeta), and retain everything else.
-The project consists of five Python files and this README.
+Extract local scientific-video metadata, align known fields with
+[BeStMeta](https://github.com/Helmholtz-UFZ/BeStMeta), and retain unmapped metadata.
 
 | File | Responsibility |
 | --- | --- |
@@ -14,9 +13,8 @@ The project consists of five Python files and this README.
 
 ## Setup
 
-Requires Python 3.11+ and a native [FFprobe](https://ffmpeg.org/download.html)
-executable. Keep the environment, data, schemas and results outside this code
-directory. In PowerShell:
+Requires Python 3.11+ and native [FFprobe](https://ffmpeg.org/download.html).
+Keep the environment, data, schemas and results outside this directory. PowerShell:
 
 ```powershell
 py -3 -m venv "$env:LOCALAPPDATA\pyvmm-venv"
@@ -26,9 +24,8 @@ $ffprobe = 'C:\tools\ffmpeg\bin\ffprobe.exe' # Set your installed executable pat
 & $ffprobe -version
 ```
 
-Run commands from the directory containing the six project files. On Linux,
+Run from the directory containing the six project files. On Linux,
 use `python3 -m venv`, the environment's `bin/python`, and `ffprobe` on PATH.
-No package installation of PyVMM is needed.
 Linux outputs require atomic no-replace directory rename support. In WSL, use a
 Linux output directory, or run Windows Python for output on a Windows drive.
 
@@ -38,11 +35,10 @@ Linux output directory, or run Windows Python for output on a Windows drive.
 & $python -B main.py 'D:\videos' -o 'D:\results\run-001' --ffprobe $ffprobe
 ```
 
-Supply one or more files or folders. Folders are searched recursively for common
-video extensions; explicitly supplied files are probed regardless of extension.
-Symbolic links and junctions are skipped. Repeated paths are processed once;
-identical content at different paths is retained and reported. Individual unreadable
-or corrupt files produce diagnostics while other files continue.
+Supply files or folders. Folders are searched recursively for common video
+extensions; explicit files are probed regardless of extension. Links and junctions
+are skipped. Repeated paths are processed once; duplicate content is retained and
+reported. Unreadable or corrupt inputs produce diagnostics while other files continue.
 
 Add researcher context and a local schema when available:
 
@@ -60,24 +56,19 @@ field names directly, or this envelope for additional research metadata:
 }
 ```
 
-Missing biological/acquisition context remains missing. File playback rate and
-duration never become camera acquisition rate or recording duration. Frame counts
-come only from reported counts. Measured fields take precedence over conflicting
-annotations; both values and their provenance remain in JSON. An explicit
-`dataset_id` replaces the generated content-based file identifier.
+Playback timing is kept separate from acquisition timing; frame counts are never
+estimated. Missing context remains missing. Measured fields take precedence over
+conflicting annotations; JSON retains both values and their provenance. An explicit
+`dataset_id` replaces the generated file identifier.
 
-The schema is optional and never downloaded automatically. A selected schema is
-captured once with its hash and full document. Supported JSON Schema drafts are
-handled by `jsonschema`; a schema without `$schema` uses Draft 2019-09. Local
-references work within that document; remote retrieval is disabled. Unsupported
-required vocabularies, missing schemas and validation failures produce drafts
-with diagnostics. New schema fields and metadata outside the schema are retained
-even when validation rejects them. Changed field meanings require reviewing the
-explicit mappings in `align.py`. Validation checks structure and declared rules;
-it cannot establish biological accuracy or completeness.
-Installed standard format checks are enabled, with strict date, date-time and URI
-checks. Unknown/custom formats remain annotations, as allowed by JSON Schema;
-patterns use Python regular-expression semantics.
+Schemas are optional local files, captured once with their hash and full document.
+`jsonschema` handles supported drafts; absent `$schema` means Draft 2019-09.
+References within the document work; network retrieval is disabled. Missing or
+unsupported schemas and failed validation produce drafts without discarding metadata.
+Unknown fields survive even when the schema rejects them. Changed field meanings
+require reviewing the mappings in `align.py`. Validation checks declared structure
+and rules, not biological accuracy. Installed standard format checks are enabled;
+unknown/custom formats remain annotations. Patterns use Python regex semantics.
 
 ## Results and validation
 
@@ -90,10 +81,8 @@ Each new output directory contains:
   components become `~0` and `~1`. Formula-like text is prefixed with an apostrophe
   for spreadsheet safety. JSON preserves the original values.
 
-Existing output paths are refused. Outputs are staged beside the target and
-published together after writing succeeds. A failed export removes its staging
-directory when possible. Memory holds one extracted record at a time; CSV rows
-are spooled to temporary disk, and discovered file identities are held in memory.
+Existing output paths are refused. Both outputs are staged and published together
+after writing succeeds; failed exports clean up their temporary files when possible.
 
 Exit codes: **0** = every record validated with no errors; **1** = results exported
 with drafts, unvalidated records or input errors; **2** = configuration/export
@@ -129,9 +118,7 @@ check the video separately using FFmpeg:
 & 'C:\tools\ffmpeg\bin\ffmpeg.exe' -v error -xerror -i 'D:\videos\recording.mp4' -map '0:v:0' -f null -
 ```
 
-Probing defaults to 60 seconds and 16 MiB combined stdout/stderr per file.
-These limits are parameters of `extract_metadata`. Local self-contained media
-demuxers are allowed explicitly in `extract.py`; playlists, external sequences
-and network inputs are outside that scope. Unsupported media retains its file
-identity and failure diagnostics. Edit the relevant stage to change discovery,
-extraction, mappings or export behavior; no plugin framework is involved.
+Probing defaults to 60 seconds and 16 MiB combined stdout/stderr per file;
+adjust these through `extract_metadata`. Allowed demuxers are listed in `extract.py`.
+Inputs must be local, self-contained media. Unsupported inputs retain their file
+identity and failure diagnostics.

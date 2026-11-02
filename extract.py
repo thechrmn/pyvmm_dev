@@ -13,8 +13,7 @@ from fractions import Fraction
 from importlib import import_module
 from pathlib import Path
 
-_import_stage = import_module("import")
-file_identity = _import_stage.file_identity
+file_identity = import_module("import").file_identity
 SUPPORTED_DEMUXERS = (
     "3g2 3gp aac asf avi flv h264 hevc m4a m4v matroska mj2 mjpeg mov mp3 mp4 "
     "mpeg mpegts mpegvideo mxf nut ogg wav webm"
@@ -169,7 +168,6 @@ def inspect_ffprobe(ffprobe="ffprobe", *, timeout=10):
         "executable": executable,
         "version": match[1],
         "banner": lines[0],
-        "sha256": _import_stage.fingerprint_file(Path(executable), Path(executable).name)["sha256"],
     }
 
 

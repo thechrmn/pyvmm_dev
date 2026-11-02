@@ -1,7 +1,5 @@
 """Map file measurements and researcher context; validate with an optional schema."""
 
-from __future__ import annotations
-
 import base64
 import hashlib
 import json
@@ -9,7 +7,6 @@ import math
 import os
 import re
 import stat
-import warnings
 from copy import deepcopy
 from datetime import date
 from pathlib import Path
@@ -230,13 +227,6 @@ def load_schema(schema_path: str | Path | None = None) -> dict:
     return context
 
 
-def schema_provenance(schema_path=None, *, schema_context=None) -> dict:
-    """Return the captured schema document and identity, detached from its state."""
-    return deepcopy(
-        (schema_context if schema_context is not None else load_schema(schema_path))["provenance"]
-    )
-
-
 def _path(parts):
     return ".".join(str(part).replace("~", "~0").replace(".", "~1") for part in parts)
 
@@ -394,27 +384,25 @@ def align_metadata(
     schema_status = info["status"]
     if context["validator_class"] is not None:
         try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("error", DeprecationWarning)
-                validator = context["validator_class"](
-                    context["schema"], format_checker=FORMATS, registry=REGISTRY
-                )
-                for outer in validator.iter_errors(bestmeta):
-                    for error in _errors(outer):
-                        errors.append(
-                            {
-                                "path": _path(error.absolute_path),
-                                "code": str(error.validator),
-                                "message": error.message,
-                                "schema_path": _path(error.absolute_schema_path),
-                            }
+            validator = context["validator_class"](
+                context["schema"], format_checker=FORMATS, registry=REGISTRY
+            )
+            for outer in validator.iter_errors(bestmeta):
+                for error in _errors(outer):
+                    errors.append(
+                        {
+                            "path": _path(error.absolute_path),
+                            "code": str(error.validator),
+                            "message": error.message,
+                            "schema_path": _path(error.absolute_schema_path),
+                        }
+                    )
+                    if error.validator == "required" and isinstance(error.instance, dict):
+                        missing.update(
+                            _path((*error.absolute_path, key))
+                            for key in error.validator_value
+                            if key not in error.instance
                         )
-                        if error.validator == "required" and isinstance(error.instance, dict):
-                            missing.update(
-                                _path((*error.absolute_path, key))
-                                for key in error.validator_value
-                                if key not in error.instance
-                            )
             schema_valid = not errors
         except Exception as error:
             schema_status = "unavailable"

@@ -87,7 +87,6 @@ def export_metadata(records, output, *, import_issues=None, schema_info=None, ru
         summary = {
             "files": 0,
             "valid": 0,
-            "draft": 0,
             "errors": sum(issue["severity"] == "error" for issue in issues),
         }
         columns = {"file", "sha256", "valid"}
