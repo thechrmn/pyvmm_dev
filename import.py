@@ -86,6 +86,8 @@ def fingerprint_file(path, relative_path):
 def import_files(inputs, *, exclude_paths=(), extensions=VIDEO_EXTENSIONS):
     """Return sorted source assets and issues; a bad input cannot hide good ones."""
     issues, roots, candidates = [], [], set()
+    if isinstance(extensions, str):
+        extensions = None if extensions.strip() == "*" else extensions.split(",")
     suffixes = (
         None
         if extensions is None

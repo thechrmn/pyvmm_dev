@@ -34,11 +34,7 @@ def main(argv: list[str] | None = None) -> int:
     }
     if any(not 0 < value < float("inf") for value in probe_options.values()):
         parser.error("Probe limits must be finite and positive.")
-    import_options = {}
-    if args.extensions is not None:
-        import_options["extensions"] = (
-            None if args.extensions == "*" else args.extensions.split(",")
-        )
+    import_options = {} if args.extensions is None else {"extensions": args.extensions}
     try:
         from align import (
             align_metadata,

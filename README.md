@@ -130,3 +130,27 @@ Inputs must be local, self-contained media. Unsupported inputs retain their file
 identity and failure diagnostics.
 Probe JSON is limited to 64 nesting levels. Rejected JSON bytes remain in
 `extraction.tool.unparsed_stdout_base64`; the remaining files still export.
+
+## Adapt the pipeline
+
+Stages exchange JSON-compatible dictionaries: `import_files` returns assets and
+issues; `extract_metadata` returns `asset`, `raw`, `technical`, `tool` and `issues`;
+`align_metadata` returns a record; `export_metadata` accepts an iterable of records.
+Keep these contracts when replacing a stage. Extraction owns backend interpretation;
+alignment owns field meanings; export owns serialization.
+
+The seven standard technical-field projections are defined once in `align.FIELD_MAP`.
+Override them per call using tuples of destination keys, for example:
+
+```python
+from align import FIELD_MAP, align_metadata
+
+mapping = {**FIELD_MAP, "height": ("image", "height_px")}
+record = align_metadata(extraction, field_map=mapping)
+```
+
+An empty map disables these projections. Raw and technical metadata remain intact.
+Overlapping paths are rejected; literal dots and tildes in keys are supported.
+Acquisition timing still requires independently supplied context.
+After updating Python, FFprobe, dependencies, schemas or mappings, rerun the
+validation checks above.

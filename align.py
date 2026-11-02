@@ -19,6 +19,17 @@ from rfc3986_validator import validate_rfc3986
 
 MAX_METADATA_BYTES = 16 * 1024 * 1024
 MAX_METADATA_DEPTH = 64
+_ACQUISITION = ("hardware_and_acquisition", "acquisition")
+FIELD_MAP = {
+    "width": (*_ACQUISITION, "video_resolution_width"),
+    "height": (*_ACQUISITION, "video_resolution_height"),
+    "frame_count": (*_ACQUISITION, "total_frame_count"),
+    "bit_depth": (*_ACQUISITION, "bit_depth"),
+    "color_mode": (*_ACQUISITION, "color_mode"),
+    "codec": (*_ACQUISITION, "video_codec"),
+    "container": (*_ACQUISITION, "video_container_format"),
+}
+
 FORMATS = FormatChecker()
 REGISTRY = Registry()  # Default retrieval fails; schemas cannot trigger network access.
 
@@ -245,42 +256,47 @@ def _path(parts):
     return ".".join(str(part).replace("~", "~0").replace(".", "~1") for part in parts)
 
 
-def _measurements(extraction):
+def _measurements(extraction, field_map):
+    for destination in field_map.values():
+        if (
+            not isinstance(destination, tuple)
+            or not destination
+            or len(destination) > MAX_METADATA_DEPTH
+            or any(not isinstance(part, str) for part in destination)
+        ):
+            raise ValueError(
+                f"Mapping destinations must contain 1-{MAX_METADATA_DEPTH} string keys in a tuple."
+            )
+    paths = sorted([("dataset_id",), *field_map.values()])
+    if any(right[: len(left)] == left for left, right in zip(paths, paths[1:])):
+        raise ValueError("Mapping destinations must not overlap.")
     technical = extraction.get("technical", {})
     digest = extraction.get("asset", {}).get("sha256", "")
     if isinstance(digest, str) and re.fullmatch(r"[a-fA-F0-9]{64}", digest):
         identifier = base64.urlsafe_b64encode(bytes.fromhex(digest)).rstrip(b"=").decode("ascii")
         yield (
-            "dataset_id",
+            ("dataset_id",),
             "ni:///sha-256;" + identifier,
             "asset.sha256",
             "generated_file_view_identifier",
         )
-    prefix = "hardware_and_acquisition.acquisition."
-    for source, destination in {
-        "width": "video_resolution_width",
-        "height": "video_resolution_height",
-        "frame_count": "total_frame_count",
-        "bit_depth": "bit_depth",
-        "color_mode": "color_mode",
-    }.items():
-        if technical.get(source) is not None:
-            yield prefix + destination, technical[source], "technical." + source, "direct"
+    values = {
+        key: (value, _path(("technical", key)), "direct")
+        for key, value in technical.items()
+        if value is not None and key not in ("codec", "container")
+    }
     codec = technical.get("codec")
     if isinstance(codec, str) and codec:
         codec = codec.lower()
-        codec = {"hevc": "h265", "rawvideo": "raw"}.get(codec, codec)
-        yield (
-            prefix + "video_codec",
-            codec,
+        values["codec"] = (
+            {"hevc": "h265", "rawvideo": "raw"}.get(codec, codec),
             "technical.codec",
             "codec_name_to_BeStMeta",
         )
     container = technical.get("container")
     if isinstance(container, str) and container:
         container = container.lower()
-        source = "technical.container"
-        method = "direct"
+        source, method = "technical.container", "direct"
         if {"mov", "mp4"}.issubset(container.split(",")):
             raw_format = extraction.get("raw", {}).get("format", {})
             tags = raw_format.get("tags", {}) if isinstance(raw_format, dict) else {}
@@ -311,12 +327,23 @@ def _measurements(extraction):
             if container != technical["container"].lower():
                 source = "raw.format.tags.major_brand"
                 method = "registered_ISOBMFF_major_brand_to_BeStMeta_container"
-        yield (
-            prefix + "video_container_format",
-            container,
-            source,
-            method,
+        values["container"] = container, source, method
+    for key, destination in field_map.items():
+        if key in values:
+            value, source, method = values[key]
+            yield destination, value, source, method
+
+
+def _same_json(left, right):
+    if isinstance(left, bool) != isinstance(right, bool):
+        return False
+    if isinstance(left, dict) and isinstance(right, dict):
+        return left.keys() == right.keys() and all(
+            _same_json(left[key], right[key]) for key in left
         )
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(_same_json(a, b) for a, b in zip(left, right))
+    return left == right
 
 
 def _evidence(source, path, value, method, selected=True):
@@ -338,16 +365,22 @@ def _errors(error):
 
 
 def align_metadata(
-    extraction: dict, annotations=None, *, schema_path=None, schema_context=None
+    extraction: dict,
+    annotations=None,
+    *,
+    schema_path=None,
+    schema_context=None,
+    field_map=None,
 ) -> dict:
     """Preserve observations and context, rejecting silent measurement overwrites."""
     context = load_schema(schema_path) if schema_context is None else schema_context
     info = context["provenance"]
     bestmeta, provenance, conflicts = {}, {}, []
     issues = deepcopy(extraction.get("issues", [])) + deepcopy(info["diagnostics"])
-    for path, value, source, method in _measurements(extraction):
+    field_map = FIELD_MAP if field_map is None else field_map
+    for parts, value, source, method in _measurements(extraction, field_map):
         target = bestmeta
-        parts = path.split(".")
+        path = _path(parts)
         for part in parts[:-1]:
             target = target.setdefault(part, {})
         target[parts[-1]] = deepcopy(value)
@@ -366,13 +399,7 @@ def align_metadata(
                 continue
             path = _path((*prefix, key))
             history = provenance.setdefault(path, [])
-            conflict = (
-                key in target
-                and path != "dataset_id"
-                and not (
-                    isinstance(existing, bool) == isinstance(value, bool) and existing == value
-                )
-            )
+            conflict = key in target and path != "dataset_id" and not _same_json(existing, value)
             if conflict:
                 if not history:
                     history.append(
