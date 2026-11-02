@@ -328,6 +328,13 @@ def _technical(raw, issues):
 
 
 def _decode_probe(output):
+    def check_depth(value, depth=0):
+        if isinstance(value, (dict, list)):
+            if depth >= 64:
+                raise ValueError("FFprobe JSON exceeds 64 nesting levels.")
+            for child in value.values() if isinstance(value, dict) else value:
+                check_depth(child, depth + 1)
+
     def constant(value):
         raise ValueError(f"Nonfinite JSON constant: {value}")
 
@@ -355,6 +362,7 @@ def _decode_probe(output):
     )
     if not isinstance(raw, dict):
         raise ValueError("FFprobe response must be an object.")
+    check_depth(raw)
     return raw
 
 

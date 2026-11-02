@@ -1,4 +1,4 @@
-"""Run import -> extraction -> BeStMeta alignment -> JSON/CSV export."""
+"""Run import -> extraction -> optional alignment/validation -> JSON/CSV export."""
 
 __version__ = "0.1.0.dev0"
 
@@ -12,11 +12,18 @@ from pathlib import Path
 
 def main(argv: list[str] | None = None) -> int:
     """Run the configured pipeline and return its documented exit status."""
-    parser = argparse.ArgumentParser(description="Extract video metadata and align it to BeStMeta.")
+    parser = argparse.ArgumentParser(
+        description="Extract video metadata; optionally map and validate it."
+    )
     parser.add_argument("--version", action="version", version=f"PyVMM {__version__}")
     parser.add_argument("inputs", nargs="+", type=Path, help="Video files or folders")
     parser.add_argument("-o", "--output", type=Path, required=True, help="New output folder")
-    parser.add_argument("--metadata", type=Path, help="Optional BeStMeta metadata JSON")
+    parser.add_argument("--metadata", type=Path, help="Optional researcher metadata JSON object")
+    alignment = parser.add_mutually_exclusive_group()
+    alignment.add_argument("--bestmeta", action="store_true", help="Use the BeStMeta field adapter")
+    alignment.add_argument(
+        "--mapping", type=Path, help="JSON file of source-to-target JSON Pointers"
+    )
     parser.add_argument(
         "--schema", type=Path, help="Optional local JSON Schema; unavailable schemas export drafts"
     )
@@ -45,6 +52,7 @@ def main(argv: list[str] | None = None) -> int:
             load_schema,
             read_json,
             validate_annotations,
+            validate_mapping,
         )
         from export import export_metadata
         from extract import extract_metadata, inspect_ffprobe
@@ -54,7 +62,11 @@ def main(argv: list[str] | None = None) -> int:
             raise FileExistsError("Choose a new output folder.")
         # One schema snapshot per run; unavailable validation must not discard evidence.
         schema_context = load_schema(args.schema)
-        metadata = validate_annotations(read_json(args.metadata) if args.metadata else {})
+        metadata = read_json(args.metadata) if args.metadata else {}
+        validate_annotations(metadata, bestmeta=args.bestmeta)
+        mapping = read_json(args.mapping) if args.mapping else None
+        if mapping is not None:
+            validate_mapping(mapping)
         probe_info = inspect_ffprobe(args.ffprobe)
         tool = probe_info["executable"]
         run_info = {
@@ -68,6 +80,8 @@ def main(argv: list[str] | None = None) -> int:
                 extract_metadata(asset, ffprobe=tool, **probe_options),
                 metadata,
                 schema_context=schema_context,
+                mapping=mapping,
+                bestmeta=args.bestmeta,
             )
             for asset in assets
         )
