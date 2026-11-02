@@ -1,11 +1,8 @@
-"""Deterministic local discovery and content fingerprints (stage 1)."""
-
-from __future__ import annotations
+"""Discover local recordings and fingerprint their unchanged bytes."""
 
 import hashlib
 import os
 import stat
-from collections.abc import Iterable
 from pathlib import Path
 
 VIDEO_EXTENSIONS = frozenset(
@@ -14,69 +11,53 @@ VIDEO_EXTENSIONS = frozenset(
 )
 
 
-def _report(issues: list, severity: str, code: str, message: str, **details) -> None:
-    issues.append(
-        dict(severity=severity, code=code, message=message, stage="import", details=details)
-    )
-
-
-def _is_link(path: Path) -> bool:
+def _is_link(path):
     try:
-        observed = path.lstat()
+        value = path.lstat()
+        return stat.S_ISLNK(value.st_mode) or getattr(value, "st_reparse_tag", 0) == 0xA0000003
     except FileNotFoundError:
         return False
-    # The junction tag also works on Python 3.11 without rejecting OneDrive's
-    # cloud-placeholder reparse points. One lstat handles both alias types.
-    return (
-        stat.S_ISLNK(observed.st_mode) or getattr(observed, "st_reparse_tag", None) == 0xA0000003
+
+
+def file_identity(value):
+    """One source snapshot shared with extraction."""
+    return dict(
+        size_bytes=value.st_size,
+        mtime_ns=value.st_mtime_ns,
+        ctime_ns=value.st_ctime_ns,
+        device_id=value.st_dev,
+        inode=value.st_ino,
     )
 
 
-def _has_alias(path: Path) -> bool:
-    return any(_is_link(part) for part in (path, *path.parents))
-
-
-def file_identity(observed: os.stat_result) -> dict:
-    """The source snapshot shared by import records and extraction checks."""
-    return {
-        "size_bytes": observed.st_size,
-        "mtime_ns": observed.st_mtime_ns,
-        "ctime_ns": observed.st_ctime_ns,
-        "device_id": observed.st_dev,
-        "inode": observed.st_ino,
-    }
-
-
-def fingerprint_file(path: Path, relative_path: str) -> dict:
-    """Hash a regular file with constant memory; reject observable concurrent writes."""
+def fingerprint_file(path, relative_path):
+    """Hash a regular file with bounded memory and observable-change checks."""
     path = Path(path).expanduser().absolute()
-    if _has_alias(path):
-        raise ValueError(f"Input contains a symbolic link or junction: {path}")
+    if any(_is_link(part) for part in (path, *path.parents)):
+        raise ValueError(f"Symbolic link or junction: {path}")
 
-    def signature(s):
-        return s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns
+    def signature(value):
+        return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns
 
     before = path.stat()
     if not stat.S_ISREG(before.st_mode):
         raise ValueError(f"Not a regular file: {path}")
-    digest = hashlib.sha256()
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
     flags |= getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(path, flags)
+    digest = hashlib.sha256()
     try:
         with os.fdopen(descriptor, "rb") as stream:
-            descriptor = -1  # The stream now owns the descriptor.
+            descriptor = -1
             opened = os.fstat(stream.fileno())
-            if not stat.S_ISREG(opened.st_mode):
-                raise ValueError(f"Input is no longer a regular file: {path}")
-            if signature(before) != signature(opened):
+            if not stat.S_ISREG(opened.st_mode) or signature(before) != signature(opened):
                 raise ValueError(f"Input changed before hashing: {path}")
             remaining = opened.st_size
             buffer = memoryview(bytearray(min(1024 * 1024, remaining)))
             while remaining:
                 count = stream.readinto(buffer[:remaining])
                 if not count:
-                    raise ValueError(f"Input was truncated during hashing: {path}")
+                    raise ValueError(f"Input truncated during hashing: {path}")
                 digest.update(buffer[:count])
                 remaining -= count
             if stream.read(1):
@@ -86,9 +67,7 @@ def fingerprint_file(path: Path, relative_path: str) -> dict:
         if descriptor != -1:
             os.close(descriptor)
     current = path.stat()
-
-    # On Windows path.stat and os.fstat can expose different ctime semantics.
-    # Compare ctime only within the same API, and identity/size/mtime across APIs.
+    # Windows stat/fstat can differ in ctime; compare it only within each API.
     if (
         signature(opened) != signature(after)
         or signature(after) != signature(current)
@@ -104,133 +83,87 @@ def fingerprint_file(path: Path, relative_path: str) -> dict:
     }
 
 
-def _discover_files(inputs, excluded, issues):
-    """Discover source paths without reading their contents."""
-    candidates: set[Path] = set()
-    roots: list[Path] = []
+def import_files(inputs, *, exclude_paths=()):
+    """Return sorted source assets and issues; a bad input cannot hide good ones."""
+    issues, roots, candidates = [], [], set()
+    excluded = [Path(path).expanduser().resolve() for path in exclude_paths]
 
-    def excluded_path(path: Path) -> bool:
-        return any(path.is_relative_to(parent) for parent in excluded)
+    def report(severity, code, message, path, **details):
+        issues.append(
+            dict(
+                severity=severity,
+                code=code,
+                message=message,
+                stage="import",
+                details={"path": str(path), **details},
+            )
+        )
 
-    def add_file(path: Path) -> None:
+    def usable(path):
         try:
             if _is_link(path):
-                _report(
-                    issues, "warning", "symlink_skipped", "Symbolic link skipped", path=str(path)
-                )
-                return
-            resolved = path.resolve()
-            if excluded_path(resolved):
-                return
-            if resolved in candidates:
-                _report(
-                    issues,
-                    "info",
-                    "duplicate_path",
-                    "Repeated input path deduplicated",
-                    path=str(resolved),
-                )
-            candidates.add(resolved)
-        except (OSError, ValueError, RuntimeError) as error:
-            _report(issues, "error", "input_unreadable", str(error), path=str(path))
-
-    def keep_directory(path: Path) -> bool:
-        try:
-            if _is_link(path):
-                _report(
-                    issues, "warning", "symlink_skipped", "Directory alias skipped", path=str(path)
-                )
+                report("warning", "symlink_skipped", "Symbolic link or junction skipped", path)
                 return False
-            return not excluded_path(path.resolve())
+            return not any(path.is_relative_to(parent) for parent in excluded)
         except (OSError, ValueError, RuntimeError) as error:
-            _report(issues, "error", "directory_unreadable", str(error), path=str(path))
+            report("error", "input_unreadable", str(error), path)
             return False
 
-    def walk_error(error: OSError) -> None:
-        _report(issues, "error", "directory_unreadable", str(error), path=str(error.filename))
+    def add(path):
+        if usable(path):
+            if path in candidates:
+                report("info", "duplicate_path", "Repeated path deduplicated", path)
+            candidates.add(path)
+
+    def walk_error(error):
+        report("error", "directory_unreadable", str(error), error.filename)
 
     for supplied in inputs:
         path = Path(supplied)
         try:
             path = path.expanduser().absolute()
-            if _has_alias(path):
-                _report(
-                    issues, "warning", "symlink_skipped", "Symbolic link skipped", path=str(path)
-                )
+            if any(_is_link(part) for part in (path, *path.parents)):
+                report("warning", "symlink_skipped", "Symbolic link or junction skipped", path)
                 continue
-            resolved = path.resolve(strict=True)
-            if excluded_path(resolved):
-                _report(
-                    issues,
-                    "error",
-                    "input_excluded",
-                    "Input is within the output directory",
-                    path=str(resolved),
-                )
-                continue
-            if resolved.is_file():
-                roots.append(resolved.parent)
-                add_file(resolved)
-            elif resolved.is_dir():
-                roots.append(resolved)
-                for directory, dirs, files in os.walk(
-                    resolved, followlinks=False, onerror=walk_error
-                ):
+            path = path.resolve(strict=True)
+            if any(path.is_relative_to(parent) for parent in excluded):
+                report("error", "input_excluded", "Input is inside the output directory", path)
+            elif path.is_file():
+                roots.append(path.parent)
+                add(path)
+            elif path.is_dir():
+                roots.append(path)
+                for directory, dirs, files in os.walk(path, followlinks=False, onerror=walk_error):
                     base = Path(directory)
-                    dirs[:] = [d for d in sorted(dirs) if keep_directory(base / d)]
+                    dirs[:] = [name for name in sorted(dirs) if usable(base / name)]
                     for name in sorted(files):
                         if Path(name).suffix.lower() in VIDEO_EXTENSIONS:
-                            add_file(base / name)
+                            add(base / name)
             else:
-                _report(
-                    issues,
-                    "error",
-                    "not_regular_file",
-                    "Input is not a regular file or directory",
-                    path=str(resolved),
-                )
+                report("error", "not_regular_file", "Not a regular file or directory", path)
         except (OSError, ValueError, RuntimeError) as error:
-            _report(issues, "error", "input_unreadable", str(error), path=str(path))
-    return candidates, roots
-
-
-def import_files(
-    inputs: Iterable[str | Path],
-    *,
-    exclude_paths: Iterable[str | Path] = (),
-) -> tuple[list[dict], list[dict]]:
-    """Discover videos, leaving duplicates by content as distinct file records.
-
-    Explicit files are probed regardless of extension. Directories use a suffix
-    allowlist. Symlinks/junctions are skipped; regular hardlinks are independent
-    paths. All failures are collected so a bad input cannot conceal good files.
-    """
-    issues: list[dict] = []
-    excluded = [Path(p).expanduser().resolve() for p in exclude_paths]
-    candidates, roots = _discover_files(inputs, excluded, issues)
+            report("error", "input_unreadable", str(error), path)
     try:
         common = Path(os.path.commonpath(roots)) if roots else None
-    except ValueError:  # e.g. multiple Windows drives: use absolute POSIX selectors.
-        common = None
-    assets: list[dict] = []
-    seen_hashes: dict[str, str] = {}
-    for path in sorted(candidates, key=lambda p: (str(p).casefold(), str(p))):
+    except ValueError:
+        common = None  # Different Windows drives: use absolute selectors.
+    assets, seen_hashes = [], {}
+    for path in sorted(candidates, key=lambda value: (str(value).casefold(), str(value))):
         try:
             relative = path.relative_to(common).as_posix() if common else path.as_posix()
             asset = fingerprint_file(path, relative)
             if asset["sha256"] in seen_hashes:
-                _report(
-                    issues,
+                report(
                     "warning",
                     "duplicate_content",
-                    "Identical bytes at multiple paths; retaining both records",
-                    path=str(path),
+                    "Identical bytes; retaining both paths",
+                    path,
                     first_path=seen_hashes[asset["sha256"]],
                 )
             seen_hashes.setdefault(asset["sha256"], str(path))
             assets.append(asset)
         except (OSError, ValueError, RuntimeError) as error:
-            _report(issues, "error", "fingerprint_failed", str(error), path=str(path))
+            report("error", "fingerprint_failed", str(error), path)
     if not assets:
-        _report(issues, "error", "no_inputs", "No readable video inputs discovered")
+        report("error", "no_inputs", "No readable video inputs discovered", "")
     return assets, issues
