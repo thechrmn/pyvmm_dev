@@ -11,46 +11,43 @@ from copy import deepcopy
 from datetime import date
 from pathlib import Path
 
+from jsonschema import FormatChecker, validators
+from referencing import Registry, Resource
+from referencing.jsonschema import specification_with
+from rfc3339_validator import validate_rfc3339
+from rfc3986_validator import validate_rfc3986
+
 MAX_METADATA_BYTES = 16 * 1024 * 1024
 MAX_METADATA_DEPTH = 64
+FORMATS = FormatChecker()
+REGISTRY = Registry()  # Default retrieval fails; schemas cannot trigger network access.
 
 
-def _format_checker():
-    from jsonschema import FormatChecker
-
-    formats = FormatChecker()
-
-    @formats.checks("date")
-    def _date(value):
-        if not isinstance(value, str):
-            return True
-        try:
-            return bool(re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value)) and bool(
-                date.fromisoformat(value)
-            )
-        except ValueError:
-            return False
-
-    @formats.checks("date-time")
-    def _datetime(value):
-        if not isinstance(value, str):
-            return True
-        from rfc3339_validator import validate_rfc3339
-
-        return (
-            value.isascii() and not value.endswith("\n") and bool(validate_rfc3339(value.upper()))
+@FORMATS.checks("date")
+def _date(value):
+    if not isinstance(value, str):
+        return True
+    try:
+        return bool(re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value)) and bool(
+            date.fromisoformat(value)
         )
+    except ValueError:
+        return False
 
-    @formats.checks("uri")
-    def _uri(value):
-        if not isinstance(value, str):
-            return True
-        from rfc3986_validator import validate_rfc3986
 
-        match = validate_rfc3986(value, rule="URI")
-        return match is not None and match.end() == len(value)
+@FORMATS.checks("date-time")
+def _datetime(value):
+    return not isinstance(value, str) or (
+        value.isascii() and not value.endswith("\n") and bool(validate_rfc3339(value.upper()))
+    )
 
-    return formats
+
+@FORMATS.checks("uri")
+def _uri(value):
+    if not isinstance(value, str):
+        return True
+    match = validate_rfc3986(value, rule="URI")
+    return match is not None and match.end() == len(value)
 
 
 def _pairs(pairs):
@@ -147,22 +144,19 @@ def read_json(path: str | Path) -> dict:
     return value
 
 
-def validate_annotations(value, *, bestmeta=True) -> dict:
-    """Normalize BeStMeta context, or keep generic metadata literal when selected."""
+def validate_annotations(value) -> dict:
+    """Normalize a bare metadata object or a bestmeta/annotations envelope."""
     if not isinstance(value, dict):
         raise ValueError("Metadata must be a JSON object.")
     _check_json(value)
-    if bestmeta and ("bestmeta" in value or set(value) == {"annotations"}):
+    if "bestmeta" in value or set(value) == {"annotations"}:
         if set(value) - {"bestmeta", "annotations"}:
             raise ValueError("Envelope fields must be bestmeta and annotations.")
-        result = {
-            "metadata": value.get("bestmeta", {}),
-            "annotations": value.get("annotations", {}),
-        }
+        result = {name: value.get(name, {}) for name in ("bestmeta", "annotations")}
         if any(not isinstance(child, dict) for child in result.values()):
             raise ValueError("bestmeta and annotations must be objects.")
     else:
-        result = {"metadata": value, "annotations": {}}
+        result = {"bestmeta": value, "annotations": {}}
     return deepcopy(result)
 
 
@@ -172,11 +166,7 @@ def _issue(code, message, severity="error"):
 
 def _check_schema_resources(resource, selected, resolver=None, seen=None):
     """Check declared dialects and vocabularies in actual schema locations only."""
-    from jsonschema import validators
-    from referencing import Registry, Resource
-    from referencing.jsonschema import specification_with
-
-    resolver = Registry().resolver_with_root(resource) if resolver is None else resolver
+    resolver = REGISTRY.resolver_with_root(resource) if resolver is None else resolver
     seen = set() if seen is None else seen
     schema = resource.contents
     if isinstance(schema, dict):
@@ -209,8 +199,8 @@ def _check_schema_resources(resource, selected, resolver=None, seen=None):
         _check_schema_resources(child, selected, resolver.in_subresource(child), seen)
 
 
-def load_schema(schema_path: str | Path | None = None, *, enabled=True) -> dict:
-    """Read the selected/default schema; only explicit opt-out skips validation."""
+def load_schema(schema_path: str | Path | None = None) -> dict:
+    """Read one optional local schema snapshot; failure never discards extraction."""
     info = {
         "path": None,
         "file_sha256": None,
@@ -218,18 +208,9 @@ def load_schema(schema_path: str | Path | None = None, *, enabled=True) -> dict:
         "status": "unavailable",
         "diagnostics": [],
     }
-    context = {"validator": None, "provenance": info}
-    if not enabled:
-        info["status"] = "not_requested"
-        return context
-    schema_path = schema_path if schema_path is not None else os.environ.get("PYVMM_SCHEMA")
-    if not schema_path:
-        info["diagnostics"].append(
-            _issue(
-                "schema_not_configured",
-                "Set PYVMM_SCHEMA to the BeStMeta schema, supply --schema, or opt out with --no-schema.",
-            )
-        )
+    context = {"schema": None, "validator_class": None, "provenance": info}
+    if schema_path is None:
+        info["diagnostics"].append(_issue("schema_not_selected", "No schema selected.", "warning"))
         return context
     try:
         path = Path(schema_path).expanduser().absolute()
@@ -240,10 +221,6 @@ def load_schema(schema_path: str | Path | None = None, *, enabled=True) -> dict:
         info["document"] = schema
         if not isinstance(schema, (dict, bool)):
             raise ValueError("A JSON Schema must be an object or boolean.")
-        from jsonschema import validators
-        from referencing import Registry, Resource
-        from referencing.jsonschema import specification_with
-
         selected = (
             validators.validator_for(schema, default=None)
             if isinstance(schema, dict) and "$schema" in schema
@@ -254,9 +231,7 @@ def load_schema(schema_path: str | Path | None = None, *, enabled=True) -> dict:
         dialect = selected.META_SCHEMA.get("$id", selected.META_SCHEMA.get("id"))
         resource = Resource.from_contents(schema, default_specification=specification_with(dialect))
         _check_schema_resources(resource, selected)
-        context.update(
-            validator=selected(schema, format_checker=_format_checker(), registry=Registry()),
-        )
+        context.update(schema=schema, validator_class=selected)
         info.update(
             status="available",
             dialect=dialect,
@@ -270,7 +245,7 @@ def _path(parts):
     return ".".join(str(part).replace("~", "~0").replace(".", "~1") for part in parts)
 
 
-def _bestmeta_measurements(extraction):
+def _measurements(extraction):
     technical = extraction.get("technical", {})
     digest = extraction.get("asset", {}).get("sha256", "")
     if isinstance(digest, str) and re.fullmatch(r"[a-fA-F0-9]{64}", digest):
@@ -344,62 +319,6 @@ def _bestmeta_measurements(extraction):
         )
 
 
-def _pointer(path):
-    if (
-        not isinstance(path, str)
-        or (path and not path.startswith("/"))
-        or re.search(r"~(?![01])", path)
-    ):
-        raise ValueError("Mapping paths must be JSON Pointers.")
-    parts = (
-        tuple(part.replace("~1", "/").replace("~0", "~") for part in path[1:].split("/"))
-        if path
-        else ()
-    )
-    if len(parts) > MAX_METADATA_DEPTH:
-        raise ValueError("Mapping path exceeds the nesting limit.")
-    return parts
-
-
-def validate_mapping(value):
-    """Check source-to-object-target pointers, rejecting overlapping destinations."""
-    if not isinstance(value, dict):
-        raise ValueError("Mapping must be a JSON object of source-to-target pointers.")
-    _check_json(value)
-    pairs = [(source, _pointer(source), _pointer(target)) for source, target in value.items()]
-    targets = sorted(target for _, _, target in pairs)
-    if any(not target for target in targets) or any(
-        right[: len(left)] == left for left, right in zip(targets, targets[1:])
-    ):
-        raise ValueError("Mapping targets must be non-root, distinct and non-overlapping.")
-    return pairs
-
-
-def _measurements(extraction, mapping, bestmeta, issues):
-    if bestmeta:
-        for path, value, source, method in _bestmeta_measurements(extraction):
-            yield tuple(path.split(".")), value, "/" + source.replace(".", "/"), method
-    elif mapping is None:
-        for key, value in extraction.get("technical", {}).items():
-            source = "/technical/" + key.replace("~", "~0").replace("/", "~1")
-            yield (key,), value, source, "direct"
-    else:
-        for source, parts, target in validate_mapping(mapping):
-            value = extraction
-            try:
-                for part in parts:
-                    if isinstance(value, list):
-                        if not re.fullmatch(r"0|[1-9][0-9]*", part):
-                            raise KeyError(part)
-                        value = value[int(part)]
-                    else:
-                        value = value[part]
-            except (KeyError, IndexError, TypeError, ValueError):
-                issues.append(_issue("mapping_source_missing", f"No value at {source}."))
-                continue
-            yield target, value, source, "explicit_mapping"
-
-
 def _evidence(source, path, value, method, selected=True):
     return {
         "source": source,
@@ -408,16 +327,6 @@ def _evidence(source, path, value, method, selected=True):
         "value": deepcopy(value),
         "selected": selected,
     }
-
-
-def _same_value(left, right):
-    if isinstance(left, dict) and isinstance(right, dict):
-        return left.keys() == right.keys() and all(
-            _same_value(left[key], right[key]) for key in left
-        )
-    if isinstance(left, list) and isinstance(right, list):
-        return len(left) == len(right) and all(_same_value(a, b) for a, b in zip(left, right))
-    return isinstance(left, bool) == isinstance(right, bool) and left == right
 
 
 def _errors(error):
@@ -429,38 +338,24 @@ def _errors(error):
 
 
 def align_metadata(
-    extraction: dict,
-    annotations=None,
-    *,
-    schema_path=None,
-    schema_context=None,
-    mapping=None,
-    bestmeta=None,
-    use_schema=True,
+    extraction: dict, annotations=None, *, schema_path=None, schema_context=None
 ) -> dict:
     """Preserve observations and context, rejecting silent measurement overwrites."""
-    bestmeta = mapping is None if bestmeta is None else bestmeta
-    if bestmeta and mapping is not None:
-        raise ValueError("Choose BeStMeta or an explicit mapping, not both.")
-    if not use_schema:
-        context = load_schema(enabled=False)
-    else:
-        context = load_schema(schema_path) if schema_context is None else schema_context
+    context = load_schema(schema_path) if schema_context is None else schema_context
     info = context["provenance"]
-    metadata, provenance, conflicts = {}, {}, []
+    bestmeta, provenance, conflicts = {}, {}, []
     issues = deepcopy(extraction.get("issues", [])) + deepcopy(info["diagnostics"])
-    for parts, value, source, method in _measurements(extraction, mapping, bestmeta, issues):
-        target = metadata
+    for path, value, source, method in _measurements(extraction):
+        target = bestmeta
+        parts = path.split(".")
         for part in parts[:-1]:
             target = target.setdefault(part, {})
         target[parts[-1]] = deepcopy(value)
-        provenance[_path(parts)] = [_evidence("extracted", source, value, method)]
+        provenance[path] = [_evidence("extracted", source, value, method)]
     try:
-        envelope = validate_annotations(
-            {} if annotations is None else annotations, bestmeta=bestmeta
-        )
+        envelope = validate_annotations({} if annotations is None else annotations)
     except (ValueError, RecursionError) as error:
-        envelope = {"metadata": {}, "annotations": {}}
+        envelope = {"bestmeta": {}, "annotations": {}}
         issues.append(_issue("invalid_annotations", str(error)))
 
     def merge(incoming, target, prefix=()):
@@ -473,8 +368,10 @@ def align_metadata(
             history = provenance.setdefault(path, [])
             conflict = (
                 key in target
-                and not (bestmeta and path == "dataset_id")
-                and not _same_value(existing, value)
+                and path != "dataset_id"
+                and not (
+                    isinstance(existing, bool) == isinstance(value, bool) and existing == value
+                )
             )
             if conflict:
                 if not history:
@@ -493,12 +390,15 @@ def align_metadata(
                 _evidence("annotation", path, value, "researcher_supplied", not conflict)
             )
 
-    merge(envelope["metadata"], metadata)
+    merge(envelope["bestmeta"], bestmeta)
     errors, missing, schema_valid = [], set(), None
     schema_status = info["status"]
-    if context["validator"] is not None:
+    if context["validator_class"] is not None:
         try:
-            for outer in context["validator"].iter_errors(metadata):
+            validator = context["validator_class"](
+                context["schema"], format_checker=FORMATS, registry=REGISTRY
+            )
+            for outer in validator.iter_errors(bestmeta):
                 for error in _errors(outer):
                     errors.append(
                         {
@@ -520,7 +420,7 @@ def align_metadata(
             issues.append(
                 _issue("schema_validation_unavailable", f"{type(error).__name__}: {error}")
             )
-    if schema_valid is None and schema_status != "not_requested":
+    if schema_valid is None:
         errors.append(
             {
                 "path": "",
@@ -530,20 +430,20 @@ def align_metadata(
         )
     elif errors:
         issues.append(
-            _issue("schema_validation_failed", f"Metadata has {len(errors)} schema errors.")
+            _issue("bestmeta_validation_failed", f"Metadata has {len(errors)} schema errors.")
         )
     errors.sort(key=lambda error: (error["path"], error["code"], error["message"]))
-    clean = not conflicts and not any(i.get("severity") == "error" for i in issues)
     return {
         "extraction": deepcopy(extraction),
-        "metadata": metadata,
+        "bestmeta": bestmeta,
         "annotations": envelope["annotations"],
         "provenance": provenance,
         "conflicts": conflicts,
         "issues": issues,
         "validation": {
-            "ok": clean and (schema_status == "not_requested" or schema_valid is True),
-            "valid": None if schema_valid is None else schema_valid and clean,
+            "valid": schema_valid is True
+            and not conflicts
+            and not any(i.get("severity") == "error" for i in issues),
             "schema_valid": schema_valid,
             "schema_status": schema_status,
             "errors": errors,

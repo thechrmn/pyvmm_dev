@@ -27,11 +27,10 @@ def _row(record):
     row = {
         "file": extraction["asset"]["relative_path"],
         "sha256": extraction["asset"]["sha256"],
-        "ok": record["validation"]["ok"],
         "valid": record["validation"]["valid"],
     }
     for name, value in (
-        ("metadata", record["metadata"]),
+        ("bestmeta", record["bestmeta"]),
         ("technical", extraction["technical"]),
         ("raw", extraction["raw"]),
         ("annotations", record["annotations"]),
@@ -88,11 +87,9 @@ def export_metadata(records, output, *, import_issues=None, schema_info=None, ru
         summary = {
             "files": 0,
             "valid": 0,
-            "unvalidated": 0,
-            "draft": 0,
             "errors": sum(issue["severity"] == "error" for issue in issues),
         }
-        columns = {"file", "sha256", "ok", "valid"}
+        columns = {"file", "sha256", "valid"}
         header = {"schema": schema_info, "run": run_info, "import_issues": issues}
         # Text JSON rows avoid retaining a whole batch or accepting binary object data.
         with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as rows:
@@ -103,14 +100,13 @@ def export_metadata(records, output, *, import_issues=None, schema_info=None, ru
                         stream.write(",\n")
                     stream.write(_json(record))
                     summary["files"] += 1
-                    summary["valid"] += record["validation"]["valid"] is True
-                    summary["unvalidated"] += record["validation"]["schema_valid"] is None
-                    summary["draft"] += not record["validation"]["ok"]
+                    summary["valid"] += record["validation"]["valid"]
                     summary["errors"] += sum(i["severity"] == "error" for i in record["issues"])
                     row = _row(record)
                     columns.update(row)
                     rows.write(_json(row) + "\n")
                     del record, row
+                summary["draft"] = summary["files"] - summary["valid"]
                 summary["success"] = (
                     bool(summary["files"]) and not summary["draft"] and not summary["errors"]
                 )
@@ -120,7 +116,7 @@ def export_metadata(records, output, *, import_issues=None, schema_info=None, ru
             with (staging / "metadata.csv").open(
                 "w", encoding="utf-8-sig", errors="backslashreplace", newline=""
             ) as stream:
-                first = ["file", "sha256", "ok", "valid"]
+                first = ["file", "sha256", "valid"]
                 writer = csv.DictWriter(
                     stream, fieldnames=first + sorted(columns.difference(first))
                 )
