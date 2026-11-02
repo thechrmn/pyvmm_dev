@@ -52,7 +52,6 @@ def main(argv: list[str] | None = None) -> int:
         schema_context = load_schema(args.schema)
         metadata = validate_annotations(read_json(args.metadata) if args.metadata else {})
         probe_info = inspect_ffprobe(args.ffprobe)
-        tool = probe_info["executable"]
         run_info = {
             "software": {"name": "PyVMM", "version": __version__},
             "python": sys.version,
@@ -61,7 +60,7 @@ def main(argv: list[str] | None = None) -> int:
         assets, issues = import_files(args.inputs, exclude_paths=[args.output], **import_options)
         records = (
             align_metadata(
-                extract_metadata(asset, ffprobe=tool, **probe_options),
+                extract_metadata(asset, ffprobe=probe_info["executable"], **probe_options),
                 metadata,
                 schema_context=schema_context,
             )

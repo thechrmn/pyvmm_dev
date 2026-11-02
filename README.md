@@ -39,8 +39,9 @@ Supply files or folders. Folders are searched recursively for common video
 extensions; explicit files are probed regardless of extension. Links and junctions
 are skipped. Repeated paths are processed once; duplicate content is retained and
 reported. Unreadable or corrupt inputs produce diagnostics while other files continue.
-Override folder filtering with `--extensions .mp4,.avi,.cine`, or use
+Override folder filtering with `--extensions .mp4,.avi,.mj2`, or use
 `--extensions '*'` to inspect every file. Explicit input files bypass this filter.
+Filtering selects candidates; it does not enable additional demuxers.
 
 Add researcher context and a local schema when available:
 
@@ -93,23 +94,46 @@ Exit codes: **0** = every record validated with no errors; **1** = results expor
 with drafts, unvalidated records or input errors; **2** = configuration/export
 failure; **130** = interrupted. A run without a schema normally returns **1**.
 
-To validate with your test videos, run a small representative folder first, then
-inspect the exported evidence:
+To validate with your test videos, run a small representative folder first. This
+check fails if JSON/CSV counts disagree or any source differs from its imported hash:
 
 ```powershell
-$report = Get-Content 'D:\results\run-001\metadata.json' -Raw -Encoding UTF8 | ConvertFrom-Json
-$report.summary
-$report.import_issues
-$report.records | ForEach-Object {
-    $_.extraction.asset.relative_path
-    $_.validation
-    $_.issues
-}
-Get-FileHash 'D:\videos\recording.mp4' -Algorithm SHA256
+@'
+import csv
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+output = Path(sys.argv[1])
+report = json.loads((output / "metadata.json").read_text(encoding="utf-8"))
+records = report["records"]
+csv.field_size_limit(2**31 - 1)  # Portable C long limit for large metadata cells.
+with (output / "metadata.csv").open(encoding="utf-8-sig", newline="") as stream:
+    rows = sum(1 for _ in csv.DictReader(stream))
+if not records or len(records) != report["summary"]["files"] or rows != len(records):
+    raise SystemExit("Export counts do not agree, or no files were exported.")
+for record in records:
+    asset = record["extraction"]["asset"]
+    with Path(asset["path"]).open("rb") as stream:
+        digest = hashlib.file_digest(stream, "sha256").hexdigest()
+    if digest != asset["sha256"]:
+        raise SystemExit(f"Source hash changed: {asset['path']}")
+    print(json.dumps({
+        "file": asset["relative_path"],
+        "validation": record["validation"],
+        "issues": record["issues"],
+    }, indent=2))
+print(json.dumps({
+    "summary": report["summary"],
+    "import_issues": report["import_issues"],
+}, indent=2))
+print("File counts and source hashes verified.")
+'@ | & $python -B - 'D:\results\run-001'
 ```
 
-Compare the hash with the corresponding record's `extraction.asset.sha256`;
-compare `technical` with a direct FFprobe inspection and independently known
+This check allows draft records; review the reported validation and input errors.
+Compare `technical` with a direct FFprobe inspection and independently known
 dimensions, reported counts and playback timing. Check unknown fields in JSON
 and CSV, and review every conflict and validation error. Repeat with no schema,
 your current schema and an updated schema: evidence must remain present in all

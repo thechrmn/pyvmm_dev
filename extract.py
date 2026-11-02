@@ -100,28 +100,28 @@ def _run_bounded(command, timeout, limit):
         )
         raise ProbeFailure(code, str(error)) from error
     pipes = [process.stdout, process.stderr]
-    buffers, opened, total = [bytearray(), bytearray()], {0, 1}, 0
+    buffers, open_pipes, output_bytes = [bytearray(), bytearray()], {0, 1}, 0
     try:
         read = _pipe_reader(pipes)
-        while opened or process.poll() is None:
+        while open_pipes or process.poll() is None:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise ProbeFailure("ffprobe_timeout", f"FFprobe exceeded {timeout:g} seconds.")
             progress = False
-            for index in tuple(opened):
-                chunk = read(pipes[index], min(65536, limit - total + 1))
+            for index in tuple(open_pipes):
+                chunk = read(pipes[index], min(65536, limit - output_bytes + 1))
                 if chunk is None:
                     continue
                 progress = True
                 if not chunk:
-                    opened.remove(index)
-                elif total + len(chunk) > limit:
+                    open_pipes.remove(index)
+                elif output_bytes + len(chunk) > limit:
                     raise ProbeFailure(
                         "ffprobe_output_limit", f"FFprobe exceeded {limit} output bytes."
                     )
                 else:
                     buffers[index].extend(chunk)
-                    total += len(chunk)
+                    output_bytes += len(chunk)
             if not progress:
                 time.sleep(min(0.01, remaining))
         return process.returncode, bytes(buffers[0]), bytes(buffers[1])
@@ -146,7 +146,7 @@ def _native_tool(executable):
 
 
 def inspect_ffprobe(ffprobe="ffprobe", *, timeout=10):
-    """Inspect the backend before importing large recordings."""
+    """Return a resolved native backend and version, or raise ValueError before import."""
     executable = shutil.which(os.fspath(ffprobe))
     if executable is None:
         raise ValueError(f"FFprobe executable not found: {ffprobe}")
@@ -367,7 +367,10 @@ def _decode_probe(output):
 
 
 def extract_metadata(asset, *, ffprobe="ffprobe", timeout=60, max_output_bytes=16_777_216):
-    """Extract one imported file; retain failures alongside its evidence."""
+    """Return raw/technical metadata and diagnostics for one fingerprinted asset.
+
+    Backend failures stay in the record; timeout and output limits bound each probe.
+    """
     executable = os.fspath(ffprobe)
     _native_tool(executable)
     result = {

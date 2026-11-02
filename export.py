@@ -71,7 +71,10 @@ def _publish(source, target):
 
 
 def export_metadata(records, output, *, import_issues=None, schema_info=None, run_info=None):
-    """Write stage records, then publish both outputs together; roll back on failure."""
+    """Consume records once and publish both outputs together; roll back on failure.
+
+    Return counts (files, valid, draft, errors) and the boolean success status.
+    """
     requested = Path(output).expanduser().absolute()
     if "\0" in os.fspath(requested):
         raise ValueError("Output path contains a null byte.")

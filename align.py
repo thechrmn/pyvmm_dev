@@ -30,6 +30,9 @@ FIELD_MAP = {
     "container": (*_ACQUISITION, "video_container_format"),
 }
 
+_MP4_BRANDS = frozenset("isom iso2 iso3 iso4 iso5 iso6 iso7 iso8 iso9 mp41 mp42 avc1 M4V".split())
+_CODEC_ALIASES = {"hevc": "h265", "rawvideo": "raw"}
+
 FORMATS = FormatChecker()
 REGISTRY = Registry()  # Default retrieval fails; schemas cannot trigger network access.
 
@@ -289,7 +292,7 @@ def _measurements(extraction, field_map):
     if isinstance(codec, str) and codec:
         codec = codec.lower()
         values["codec"] = (
-            {"hevc": "h265", "rawvideo": "raw"}.get(codec, codec),
+            _CODEC_ALIASES.get(codec, codec),
             "technical.codec",
             "codec_name_to_BeStMeta",
         )
@@ -302,28 +305,10 @@ def _measurements(extraction, field_map):
             tags = raw_format.get("tags", {}) if isinstance(raw_format, dict) else {}
             brand = tags.get("major_brand") if isinstance(tags, dict) else None
             brand = brand.strip() if isinstance(brand, str) else ""
-            container = (
-                "mov"
-                if brand == "qt"
-                else "mp4"
-                if brand
-                in {
-                    "isom",
-                    "iso2",
-                    "iso3",
-                    "iso4",
-                    "iso5",
-                    "iso6",
-                    "iso7",
-                    "iso8",
-                    "iso9",
-                    "mp41",
-                    "mp42",
-                    "avc1",
-                    "M4V",
-                }
-                else container
-            )
+            if brand == "qt":
+                container = "mov"
+            elif brand in _MP4_BRANDS:
+                container = "mp4"
             if container != technical["container"].lower():
                 source = "raw.format.tags.major_brand"
                 method = "registered_ISOBMFF_major_brand_to_BeStMeta_container"
@@ -335,6 +320,7 @@ def _measurements(extraction, field_map):
 
 
 def _same_json(left, right):
+    """Compare JSON recursively: numeric forms may agree, booleans remain distinct."""
     if isinstance(left, bool) != isinstance(right, bool):
         return False
     if isinstance(left, dict) and isinstance(right, dict):
@@ -372,7 +358,11 @@ def align_metadata(
     schema_context=None,
     field_map=None,
 ) -> dict:
-    """Preserve observations and context, rejecting silent measurement overwrites."""
+    """Return detached evidence, merged metadata, conflicts and schema diagnostics.
+
+    field_map maps technical keys to destination tuples; None uses FIELD_MAP,
+    while an empty map disables projections. Schema failures produce draft records.
+    """
     context = load_schema(schema_path) if schema_context is None else schema_context
     info = context["provenance"]
     bestmeta, provenance, conflicts = {}, {}, []

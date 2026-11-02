@@ -7,7 +7,7 @@ from pathlib import Path
 
 VIDEO_EXTENSIONS = frozenset(
     ".avi .mp4 .mov .mkv .m4v .mpg .mpeg .webm .wmv .flv .mts .m2ts .vob "
-    ".ogv .mjpeg .mjpg .h264 .h265 .hevc .3gp .ts .mxf .nut".split()
+    ".ogv .mjpeg .mjpg .mj2 .h264 .h265 .hevc .3gp .3g2 .ts .mxf .nut".split()
 )
 
 
@@ -84,7 +84,10 @@ def fingerprint_file(path, relative_path):
 
 
 def import_files(inputs, *, exclude_paths=(), extensions=VIDEO_EXTENSIONS):
-    """Return sorted source assets and issues; a bad input cannot hide good ones."""
+    """Return sorted (assets, issues); a bad input cannot hide good ones.
+
+    extensions accepts an iterable, a comma-separated string, or None for all files.
+    """
     issues, roots, candidates = [], [], set()
     if isinstance(extensions, str):
         extensions = None if extensions.strip() == "*" else extensions.split(",")
