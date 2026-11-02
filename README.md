@@ -1,7 +1,7 @@
 # PyVMM
 
-Extract scientific-video metadata, optionally map it to a metadata standard and
-validate it against a local **JSON Schema**. Raw evidence is always retained.
+Extract scientific-video metadata and align it with **BeStMeta by default**.
+Switch to another JSON Schema or explicitly skip validation. Raw evidence is retained.
 The project is five Python files and this README.
 
 | File | Responsibility |
@@ -12,45 +12,55 @@ The project is five Python files and this README.
 | `align.py` | Map fields, merge context, retain conflicts and optionally validate. |
 | `export.py` | Stream JSON/CSV and publish both together into a new directory. |
 
-## Setup and schema-free use
+## Setup and normal BeStMeta use
 
 Requires Python 3.11+ and native [FFprobe](https://ffmpeg.org/download.html).
-**No third-party Python packages are required without schema validation.**
+Schema validation uses the packages below. Explicit schema-free runs need only
+Python's standard library and FFprobe.
 Keep environments, data, optional configuration and outputs outside this directory.
 In PowerShell:
 
 ```powershell
 py -3 -m venv "$env:LOCALAPPDATA\pyvmm-venv"
 $python = "$env:LOCALAPPDATA\pyvmm-venv\Scripts\python.exe"
+& $python -m pip install jsonschema==4.26.0 referencing==0.37.0 rfc3339-validator==0.1.4 rfc3986-validator==0.1.1
 $ffprobe = 'C:\tools\ffmpeg\bin\ffprobe.exe' # Set your installed executable path.
+$env:PYVMM_SCHEMA = 'D:\schemas\bestmeta.json' # Your local BeStMeta JSON Schema.
 & $python -B main.py 'D:\videos' -o 'D:\results\run-001' --ffprobe $ffprobe
 ```
+
+Configure `PYVMM_SCHEMA` in your shell profile/environment for subsequent sessions.
+`--schema PATH` overrides it for one run, including for an updated BeStMeta schema.
+An unset or unavailable default schema produces preserved drafts and diagnostics;
+validation is skipped only when explicitly requested.
 
 Run from the directory containing these six files. On Linux, use `python3 -m venv`,
 the environment's `bin/python`, and FFprobe on PATH. WSL output must use a Linux
 filesystem supporting atomic no-replace directory rename; use Windows Python
 for output on a Windows drive.
 
-By default, `metadata` contains technical fields with their original names, merged
-with an optional `--metadata 'D:\study.json'` object shared by all input files.
-Generic metadata is taken literally, including keys named `metadata`, `bestmeta`
-or `annotations`. Measured values take precedence on conflict; both values and
-their provenance remain in JSON. Playback timing never becomes acquisition timing,
-and missing frame counts are never estimated.
+By default, `metadata` contains BeStMeta fields merged with optional
+`--metadata 'D:\study.json'` context shared by all inputs. The adapter accepts
+bare BeStMeta metadata or `{"bestmeta": {...}, "annotations": {...}}`.
+Measured values take precedence on conflict; both values and their provenance
+remain in JSON. Playback timing never becomes acquisition timing, and missing
+frame counts are never estimated.
 
-## Optional schemas and mappings
+## Skip or switch schemas
 
-Install these packages only to enable schema validation:
+To skip validation while retaining normal BeStMeta mapping:
 
 ```powershell
-& $python -m pip install jsonschema==4.26.0 referencing==0.37.0 rfc3339-validator==0.1.4 rfc3986-validator==0.1.1
+& $python -B main.py 'D:\videos' -o 'D:\results\unvalidated' --ffprobe $ffprobe --no-schema
 ```
 
-The RFC packages are used only when checking date-time or URI strings.
+Use `--generic --no-schema` for native technical field names without BeStMeta
+mapping or validation. `--generic --schema PATH` validates those native fields
+against another schema. Generic researcher metadata is taken literally.
 
-`--schema` validates the candidate `metadata` object. A schema does not determine
-field meanings or rename measurements automatically. Use `--mapping` when target
-names or structure differ. For example, an external UTF-8 `mapping.json`:
+Schema selection and field mapping are independent: changing `--schema` alone
+keeps the BeStMeta adapter. For another field structure, `--mapping` replaces
+that adapter. For example, an external UTF-8 `mapping.json`:
 
 ```json
 {
@@ -64,24 +74,18 @@ names or structure differ. For example, an external UTF-8 `mapping.json`:
 & $python -B main.py 'D:\videos' -o 'D:\results\run-002' --ffprobe $ffprobe --schema 'D:\schemas\custom.json' --mapping 'D:\mapping.json' --metadata 'D:\study.json'
 ```
 
-Mappings replace the default technical-field mapping and work without a schema
-too. Sources are JSON Pointers into `extraction`; targets create object fields in
+Mappings work with a selected schema or `--no-schema`.
+Sources are JSON Pointers into `extraction`; targets create object fields in
 `metadata`. Escape `/` as `~1` and `~` as `~0`. Sources may index arrays; map an
 entire array to a target field when needed. Overlapping targets are rejected;
 unavailable source values produce diagnostics. An empty mapping `{}` uses only
 researcher metadata. Unmapped raw and technical fields remain in the exports.
 
-For [BeStMeta](https://github.com/Helmholtz-UFZ/BeStMeta), opt into its adapter:
-
-```powershell
-& $python -B main.py 'D:\videos' -o 'D:\results\run-003' --ffprobe $ffprobe --bestmeta --schema 'D:\schemas\bestmeta.json' --metadata 'D:\study.json'
-```
-
-`--bestmeta` and `--mapping` are alternatives. The BeStMeta adapter also works
-without a schema. It accepts bare BeStMeta metadata or the legacy envelope
-`{"bestmeta": {...}, "annotations": {...}}`. Its generated file identifier may
-be replaced by a supplied `dataset_id`. Output always uses the neutral `metadata`
-key and `metadata.*` CSV columns, including in BeStMeta mode.
+`--bestmeta` explicitly selects the default
+[BeStMeta](https://github.com/Helmholtz-UFZ/BeStMeta) adapter; it is mutually exclusive
+with `--generic` and `--mapping`. Its generated file identifier may be replaced
+by a supplied `dataset_id`. Every mode exports the neutral `metadata` key and
+`metadata.*` CSV columns. The RFC packages are needed only for date-time/URI checks.
 
 Schemas are captured once with their hash and complete document. The declared
 draft is used, or the installed validator's default if none is declared; the
@@ -104,7 +108,7 @@ declared rules, not scientific accuracy.
 `validation.ok` reports whether the record completed without errors and passed
 any requested validation. `schema_valid` reports schema conformance; `valid` also
 accounts for operational errors and conflicts. Both are `null` when validation
-is not requested or unavailable. Intentional schema-free runs have
+is not requested or unavailable. Runs with `--no-schema` have
 `schema_status: "not_requested"` and can succeed without claiming conformance.
 The summary counts validated, unvalidated and draft records separately.
 

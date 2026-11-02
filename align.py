@@ -147,8 +147,8 @@ def read_json(path: str | Path) -> dict:
     return value
 
 
-def validate_annotations(value, *, bestmeta=False) -> dict:
-    """Keep generic metadata literal; accept the legacy envelope only on opt-in."""
+def validate_annotations(value, *, bestmeta=True) -> dict:
+    """Normalize BeStMeta context, or keep generic metadata literal when selected."""
     if not isinstance(value, dict):
         raise ValueError("Metadata must be a JSON object.")
     _check_json(value)
@@ -209,8 +209,8 @@ def _check_schema_resources(resource, selected, resolver=None, seen=None):
         _check_schema_resources(child, selected, resolver.in_subresource(child), seen)
 
 
-def load_schema(schema_path: str | Path | None = None) -> dict:
-    """Read one optional local schema snapshot; failure never discards extraction."""
+def load_schema(schema_path: str | Path | None = None, *, enabled=True) -> dict:
+    """Read the selected/default schema; only explicit opt-out skips validation."""
     info = {
         "path": None,
         "file_sha256": None,
@@ -219,8 +219,17 @@ def load_schema(schema_path: str | Path | None = None) -> dict:
         "diagnostics": [],
     }
     context = {"validator": None, "provenance": info}
-    if schema_path is None:
+    if not enabled:
         info["status"] = "not_requested"
+        return context
+    schema_path = schema_path if schema_path is not None else os.environ.get("PYVMM_SCHEMA")
+    if not schema_path:
+        info["diagnostics"].append(
+            _issue(
+                "schema_not_configured",
+                "Set PYVMM_SCHEMA to the BeStMeta schema, supply --schema, or opt out with --no-schema.",
+            )
+        )
         return context
     try:
         path = Path(schema_path).expanduser().absolute()
@@ -426,12 +435,17 @@ def align_metadata(
     schema_path=None,
     schema_context=None,
     mapping=None,
-    bestmeta=False,
+    bestmeta=None,
+    use_schema=True,
 ) -> dict:
     """Preserve observations and context, rejecting silent measurement overwrites."""
+    bestmeta = mapping is None if bestmeta is None else bestmeta
     if bestmeta and mapping is not None:
         raise ValueError("Choose BeStMeta or an explicit mapping, not both.")
-    context = load_schema(schema_path) if schema_context is None else schema_context
+    if not use_schema:
+        context = load_schema(enabled=False)
+    else:
+        context = load_schema(schema_path) if schema_context is None else schema_context
     info = context["provenance"]
     metadata, provenance, conflicts = {}, {}, []
     issues = deepcopy(extraction.get("issues", [])) + deepcopy(info["diagnostics"])

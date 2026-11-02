@@ -13,20 +13,29 @@ from pathlib import Path
 def main(argv: list[str] | None = None) -> int:
     """Run the configured pipeline and return its documented exit status."""
     parser = argparse.ArgumentParser(
-        description="Extract video metadata; optionally map and validate it."
+        description="Extract video metadata using BeStMeta by default; switch or skip schemas explicitly."
     )
     parser.add_argument("--version", action="version", version=f"PyVMM {__version__}")
     parser.add_argument("inputs", nargs="+", type=Path, help="Video files or folders")
     parser.add_argument("-o", "--output", type=Path, required=True, help="New output folder")
     parser.add_argument("--metadata", type=Path, help="Optional researcher metadata JSON object")
     alignment = parser.add_mutually_exclusive_group()
-    alignment.add_argument("--bestmeta", action="store_true", help="Use the BeStMeta field adapter")
+    alignment.add_argument(
+        "--bestmeta", action="store_true", default=None, help="Use BeStMeta fields (default)"
+    )
+    alignment.add_argument(
+        "--generic",
+        dest="bestmeta",
+        action="store_false",
+        default=None,
+        help="Use native technical field names",
+    )
     alignment.add_argument(
         "--mapping", type=Path, help="JSON file of source-to-target JSON Pointers"
     )
-    parser.add_argument(
-        "--schema", type=Path, help="Optional local JSON Schema; unavailable schemas export drafts"
-    )
+    schemas = parser.add_mutually_exclusive_group()
+    schemas.add_argument("--schema", type=Path, help="JSON Schema path; defaults to PYVMM_SCHEMA")
+    schemas.add_argument("--no-schema", action="store_true", help="Skip schema validation")
     parser.add_argument("--ffprobe", default="ffprobe", help="FFprobe executable")
     parser.add_argument("--timeout", type=float, help="Per-file probe timeout in seconds")
     parser.add_argument("--max-output-bytes", type=int, help="Per-file combined probe output limit")
@@ -34,6 +43,7 @@ def main(argv: list[str] | None = None) -> int:
         "--extensions", help="Comma-separated folder extensions; * includes all files"
     )
     args = parser.parse_args(argv)
+    bestmeta = args.mapping is None if args.bestmeta is None else args.bestmeta
     probe_options = {
         key: getattr(args, key)
         for key in ("timeout", "max_output_bytes")
@@ -61,9 +71,9 @@ def main(argv: list[str] | None = None) -> int:
         if os.path.lexists(args.output.expanduser()):
             raise FileExistsError("Choose a new output folder.")
         # One schema snapshot per run; unavailable validation must not discard evidence.
-        schema_context = load_schema(args.schema)
+        schema_context = load_schema(args.schema, enabled=not args.no_schema)
         metadata = read_json(args.metadata) if args.metadata else {}
-        validate_annotations(metadata, bestmeta=args.bestmeta)
+        validate_annotations(metadata, bestmeta=bestmeta)
         mapping = read_json(args.mapping) if args.mapping else None
         if mapping is not None:
             validate_mapping(mapping)
@@ -73,6 +83,11 @@ def main(argv: list[str] | None = None) -> int:
             "software": {"name": "PyVMM", "version": __version__},
             "python": sys.version,
             "ffprobe": probe_info,
+            "alignment": "bestmeta"
+            if bestmeta
+            else "mapping"
+            if mapping is not None
+            else "identity",
         }
         assets, issues = import_files(args.inputs, exclude_paths=[args.output], **import_options)
         records = (
@@ -81,7 +96,7 @@ def main(argv: list[str] | None = None) -> int:
                 metadata,
                 schema_context=schema_context,
                 mapping=mapping,
-                bestmeta=args.bestmeta,
+                bestmeta=bestmeta,
             )
             for asset in assets
         )
