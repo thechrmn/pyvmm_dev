@@ -21,7 +21,24 @@ def main(argv: list[str] | None = None) -> int:
         "--schema", type=Path, help="Optional local JSON Schema; unavailable schemas export drafts"
     )
     parser.add_argument("--ffprobe", default="ffprobe", help="FFprobe executable")
+    parser.add_argument("--timeout", type=float, help="Per-file probe timeout in seconds")
+    parser.add_argument("--max-output-bytes", type=int, help="Per-file combined probe output limit")
+    parser.add_argument(
+        "--extensions", help="Comma-separated folder extensions; * includes all files"
+    )
     args = parser.parse_args(argv)
+    probe_options = {
+        key: getattr(args, key)
+        for key in ("timeout", "max_output_bytes")
+        if getattr(args, key) is not None
+    }
+    if any(not 0 < value < float("inf") for value in probe_options.values()):
+        parser.error("Probe limits must be finite and positive.")
+    import_options = {}
+    if args.extensions is not None:
+        import_options["extensions"] = (
+            None if args.extensions == "*" else args.extensions.split(",")
+        )
     try:
         from align import (
             align_metadata,
@@ -45,10 +62,12 @@ def main(argv: list[str] | None = None) -> int:
             "python": sys.version,
             "ffprobe": probe_info,
         }
-        assets, issues = import_files(args.inputs, exclude_paths=[args.output])
+        assets, issues = import_files(args.inputs, exclude_paths=[args.output], **import_options)
         records = (
             align_metadata(
-                extract_metadata(asset, ffprobe=tool), metadata, schema_context=schema_context
+                extract_metadata(asset, ffprobe=tool, **probe_options),
+                metadata,
+                schema_context=schema_context,
             )
             for asset in assets
         )

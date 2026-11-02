@@ -11,7 +11,7 @@ from copy import deepcopy
 from datetime import date
 from pathlib import Path
 
-from jsonschema import Draft201909Validator, FormatChecker, validators
+from jsonschema import FormatChecker, validators
 from referencing import Registry, Resource
 from referencing.jsonschema import specification_with
 from rfc3339_validator import validate_rfc3339
@@ -205,11 +205,10 @@ def load_schema(schema_path: str | Path | None = None) -> dict:
         info["document"] = schema
         if not isinstance(schema, (dict, bool)):
             raise ValueError("A JSON Schema must be an object or boolean.")
-        selected = validators.validator_for(
-            schema,
-            default=None
+        selected = (
+            validators.validator_for(schema, default=None)
             if isinstance(schema, dict) and "$schema" in schema
-            else Draft201909Validator,
+            else validators.validator_for(schema)
         )
         if selected is None:
             raise ValueError("Unsupported JSON Schema dialect.")
@@ -258,17 +257,15 @@ def _measurements(extraction):
         codec = {"hevc": "h265", "rawvideo": "raw"}.get(codec, codec)
         yield (
             prefix + "video_codec",
-            codec
-            if codec in {"h264", "h265", "ffv1", "av1", "mjpeg", "mpeg4", "raw", "other"}
-            else "other",
+            codec,
             "technical.codec",
-            "BeStMeta_controlled_vocabulary",
+            "codec_name_to_BeStMeta",
         )
     container = technical.get("container")
     if isinstance(container, str) and container:
         container = container.lower()
         source = "technical.container"
-        method = "BeStMeta_controlled_vocabulary"
+        method = "direct"
         if {"mov", "mp4"}.issubset(container.split(",")):
             raw_format = extraction.get("raw", {}).get("format", {})
             tags = raw_format.get("tags", {}) if isinstance(raw_format, dict) else {}
@@ -294,15 +291,14 @@ def _measurements(extraction):
                     "avc1",
                     "M4V",
                 }
-                else "other"
+                else container
             )
-            source = "raw.format.tags.major_brand"
-            method = "registered_ISOBMFF_major_brand_to_BeStMeta_container"
+            if container != technical["container"].lower():
+                source = "raw.format.tags.major_brand"
+                method = "registered_ISOBMFF_major_brand_to_BeStMeta_container"
         yield (
             prefix + "video_container_format",
-            container
-            if container in {"mp4", "avi", "hdf5", "mov", "image_seq", "other"}
-            else "other",
+            container,
             source,
             method,
         )

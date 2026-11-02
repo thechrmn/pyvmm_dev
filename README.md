@@ -39,6 +39,8 @@ Supply files or folders. Folders are searched recursively for common video
 extensions; explicit files are probed regardless of extension. Links and junctions
 are skipped. Repeated paths are processed once; duplicate content is retained and
 reported. Unreadable or corrupt inputs produce diagnostics while other files continue.
+Override folder filtering with `--extensions .mp4,.avi,.cine`, or use
+`--extensions '*'` to inspect every file. Explicit input files bypass this filter.
 
 Add researcher context and a local schema when available:
 
@@ -62,13 +64,16 @@ conflicting annotations; JSON retains both values and their provenance. An expli
 `dataset_id` replaces the generated file identifier.
 
 Schemas are optional local files, captured once with their hash and full document.
-`jsonschema` handles supported drafts; absent `$schema` means Draft 2019-09.
+`jsonschema` selects the declared draft, or its installed default when `$schema`
+is absent; the active dialect is recorded in the export.
 References within the document work; network retrieval is disabled. Missing or
 unsupported schemas and failed validation produce drafts without discarding metadata.
 Unknown fields survive even when the schema rejects them. Changed field meanings
 require reviewing the mappings in `align.py`. Validation checks declared structure
 and rules, not biological accuracy. Installed standard format checks are enabled;
 unknown/custom formats remain annotations. Patterns use Python regex semantics.
+Codec and container candidates are validated by that schema, without duplicated
+value lists or automatic replacement of unknown values with `other`.
 
 ## Results and validation
 
@@ -119,6 +124,7 @@ check the video separately using FFmpeg:
 ```
 
 Probing defaults to 60 seconds and 16 MiB combined stdout/stderr per file;
-adjust these through `extract_metadata`. Allowed demuxers are listed in `extract.py`.
+override with `--timeout 120 --max-output-bytes 33554432`.
+Allowed self-contained demuxers are listed in `extract.py`.
 Inputs must be local, self-contained media. Unsupported inputs retain their file
 identity and failure diagnostics.

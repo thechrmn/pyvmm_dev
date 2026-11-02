@@ -83,9 +83,14 @@ def fingerprint_file(path, relative_path):
     }
 
 
-def import_files(inputs, *, exclude_paths=()):
+def import_files(inputs, *, exclude_paths=(), extensions=VIDEO_EXTENSIONS):
     """Return sorted source assets and issues; a bad input cannot hide good ones."""
     issues, roots, candidates = [], [], set()
+    suffixes = (
+        None
+        if extensions is None
+        else {"." + suffix.strip().lstrip(".").lower() for suffix in extensions}
+    )
     excluded = [Path(path).expanduser().resolve() for path in exclude_paths]
 
     def report(severity, code, message, path, **details):
@@ -137,7 +142,7 @@ def import_files(inputs, *, exclude_paths=()):
                     base = Path(directory)
                     dirs[:] = [name for name in sorted(dirs) if usable(base / name)]
                     for name in sorted(files):
-                        if Path(name).suffix.lower() in VIDEO_EXTENSIONS:
+                        if suffixes is None or Path(name).suffix.lower() in suffixes:
                             add(base / name)
             else:
                 report("error", "not_regular_file", "Not a regular file or directory", path)
