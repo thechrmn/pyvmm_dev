@@ -1,4 +1,9 @@
-"""Discover local recordings and fingerprint their unchanged bytes."""
+"""Stage 1 - find local video files and fingerprint their bytes with SHA-256.
+
+The file is named ``import.py`` by design, so ``main.py`` loads it with
+``importlib.import_module("import")``. Stages exchange plain dictionaries only,
+so no other module imports this one.
+"""
 
 import hashlib
 import os
@@ -7,173 +12,118 @@ from pathlib import Path
 
 VIDEO_EXTENSIONS = frozenset(
     ".avi .mp4 .mov .mkv .m4v .mpg .mpeg .webm .wmv .flv .mts .m2ts .vob "
-    ".ogv .mjpeg .mjpg .mj2 .h264 .h265 .hevc .3gp .3g2 .ts .mxf .nut".split()
+    ".ogv .mjpeg .mjpg .mj2 .h264 .h265 .hevc .3gp .3g2 .ts .mxf .nut .dv .y4m .ivf .m2v".split()
 )
 
 
+def _issue(issues, code, message, path=None, severity="warning"):
+    issue = {"severity": severity, "code": code, "message": message, "stage": "import"}
+    if path is not None:
+        issue["path"] = str(path)
+    issues.append(issue)
+
+
 def _is_link(path):
+    """True for symbolic links and Windows junctions (mount points)."""
     try:
-        value = path.lstat()
-        return stat.S_ISLNK(value.st_mode) or getattr(value, "st_reparse_tag", 0) == 0xA0000003
-    except FileNotFoundError:
+        info = path.lstat()
+    except OSError:
         return False
-
-
-def file_identity(value):
-    """One source snapshot shared with extraction."""
-    return dict(
-        size_bytes=value.st_size,
-        mtime_ns=value.st_mtime_ns,
-        ctime_ns=value.st_ctime_ns,
-        device_id=value.st_dev,
-        inode=value.st_ino,
-    )
+    return stat.S_ISLNK(info.st_mode) or getattr(info, "st_reparse_tag", 0) == 0xA0000003
 
 
 def fingerprint_file(path, relative_path):
-    """Hash a regular file with bounded memory and observable-change checks."""
-    path = Path(path).expanduser().absolute()
-    if any(_is_link(part) for part in (path, *path.parents)):
-        raise ValueError(f"Symbolic link or junction: {path}")
+    """Return the asset record of one regular file.
 
-    def signature(value):
-        return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns
-
+    Raises OSError or ValueError if the path is not a regular file or its size or
+    modification time changed while it was being read.
+    """
+    path = Path(path)
     before = path.stat()
     if not stat.S_ISREG(before.st_mode):
         raise ValueError(f"Not a regular file: {path}")
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
-    flags |= getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags)
-    digest = hashlib.sha256()
-    try:
-        with os.fdopen(descriptor, "rb") as stream:
-            descriptor = -1
-            opened = os.fstat(stream.fileno())
-            if not stat.S_ISREG(opened.st_mode) or signature(before) != signature(opened):
-                raise ValueError(f"Input changed before hashing: {path}")
-            remaining = opened.st_size
-            buffer = memoryview(bytearray(min(1024 * 1024, remaining)))
-            while remaining:
-                count = stream.readinto(buffer[:remaining])
-                if not count:
-                    raise ValueError(f"Input truncated during hashing: {path}")
-                digest.update(buffer[:count])
-                remaining -= count
-            if stream.read(1):
-                raise ValueError(f"Input grew during hashing: {path}")
-            after = os.fstat(stream.fileno())
-    finally:
-        if descriptor != -1:
-            os.close(descriptor)
-    current = path.stat()
-    # Windows stat/fstat can differ in ctime; compare it only within each API.
-    if (
-        signature(opened) != signature(after)
-        or signature(after) != signature(current)
-        or before.st_ctime_ns != current.st_ctime_ns
-        or opened.st_ctime_ns != after.st_ctime_ns
-    ):
-        raise ValueError(f"Input changed during hashing: {path}")
+    with path.open("rb") as stream:
+        digest = hashlib.file_digest(stream, "sha256")
+    after = path.stat()
+    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+        raise ValueError(f"File changed while it was being read: {path}")
     return {
         "path": str(path),
         "relative_path": relative_path,
-        **file_identity(current),
+        "size_bytes": after.st_size,
+        "mtime_ns": after.st_mtime_ns,
         "sha256": digest.hexdigest(),
     }
 
 
-def import_files(inputs, *, exclude_paths=(), extensions=VIDEO_EXTENSIONS):
-    """Return sorted (assets, issues); a bad input cannot hide good ones.
+def _walk(root, wanted, issues):
+    """Yield matching files below root; links inside the tree are reported, never followed."""
 
-    extensions accepts an iterable, a comma-separated string, or None for all files.
-    """
-    issues, roots, candidates = [], [], set()
-    if isinstance(extensions, str):
-        extensions = None if extensions.strip() == "*" else extensions.split(",")
-    suffixes = (
-        None
-        if extensions is None
-        else {"." + suffix.strip().lstrip(".").lower() for suffix in extensions}
-    )
-    excluded = [Path(path).expanduser().resolve() for path in exclude_paths]
+    def unreadable(error):
+        _issue(issues, "folder_unreadable", str(error), error.filename, "error")
 
-    def report(severity, code, message, path, **details):
-        issues.append(
-            dict(
-                severity=severity,
-                code=code,
-                message=message,
-                stage="import",
-                details={"path": str(path), **details},
-            )
-        )
-
-    def usable(path):
-        try:
-            if _is_link(path):
-                report("warning", "symlink_skipped", "Symbolic link or junction skipped", path)
-                return False
-            return not any(path.is_relative_to(parent) for parent in excluded)
-        except (OSError, ValueError, RuntimeError) as error:
-            report("error", "input_unreadable", str(error), path)
-            return False
-
-    def add(path):
-        if usable(path):
-            if path in candidates:
-                report("info", "duplicate_path", "Repeated path deduplicated", path)
-            candidates.add(path)
-
-    def walk_error(error):
-        report("error", "directory_unreadable", str(error), error.filename)
-
-    for supplied in inputs:
-        path = Path(supplied)
-        try:
-            path = path.expanduser().absolute()
-            if any(_is_link(part) for part in (path, *path.parents)):
-                report("warning", "symlink_skipped", "Symbolic link or junction skipped", path)
+    for current, dirs, files in os.walk(root, onerror=unreadable):
+        folder = Path(current)
+        dirs.sort()
+        for name in [d for d in dirs if _is_link(folder / d)]:
+            dirs.remove(name)
+            _issue(issues, "symlink_skipped", "Linked folder was not followed.", folder / name)
+        for name in sorted(files):
+            path = folder / name
+            if wanted is not None and path.suffix.lower() not in wanted:
                 continue
-            path = path.resolve(strict=True)
-            if any(path.is_relative_to(parent) for parent in excluded):
-                report("error", "input_excluded", "Input is inside the output directory", path)
-            elif path.is_file():
-                roots.append(path.parent)
-                add(path)
-            elif path.is_dir():
-                roots.append(path)
-                for directory, dirs, files in os.walk(path, followlinks=False, onerror=walk_error):
-                    base = Path(directory)
-                    dirs[:] = [name for name in sorted(dirs) if usable(base / name)]
-                    for name in sorted(files):
-                        if suffixes is None or Path(name).suffix.lower() in suffixes:
-                            add(base / name)
+            if _is_link(path):
+                _issue(issues, "symlink_skipped", "Linked file was not imported.", path)
             else:
-                report("error", "not_regular_file", "Not a regular file or directory", path)
-        except (OSError, ValueError, RuntimeError) as error:
-            report("error", "input_unreadable", str(error), path)
-    try:
-        common = Path(os.path.commonpath(roots)) if roots else None
-    except ValueError:
-        common = None  # Different Windows drives: use absolute selectors.
-    assets, seen_hashes = [], {}
-    for path in sorted(candidates, key=lambda value: (str(value).casefold(), str(value))):
+                yield path
+
+
+def _collect(inputs, wanted, issues):
+    """Resolve the inputs: return (ordered set of files to import, folders they are found under)."""
+    found, anchors = {}, []
+    for item in inputs:
         try:
-            relative = path.relative_to(common).as_posix() if common else path.as_posix()
+            root = Path(item).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            _issue(issues, "input_not_found", f"{type(error).__name__}: {error}", item, "error")
+            continue
+        if root.is_dir():
+            anchors.append(root)
+            found.update(dict.fromkeys(_walk(root, wanted, issues)))
+        elif root.is_file():
+            anchors.append(root.parent)
+            found[root] = None
+        else:
+            _issue(issues, "input_unsupported", "Not a file or folder.", item, "error")
+    return found, anchors
+
+
+def import_files(inputs, issues, *, extensions=VIDEO_EXTENSIONS):
+    """Yield one fingerprinted asset per distinct input file, in a stable order.
+
+    ``inputs`` are files or folders. Paths you name are resolved, so they may reach
+    the data through links. Folders are searched recursively for ``extensions``
+    (``"*"`` accepts every file); explicit files are always imported. Problems are
+    appended to ``issues`` (the list is complete once the generator is exhausted).
+    """
+    wanted = None if "*" in extensions else frozenset("." + e.lstrip(".").lower() for e in extensions)
+    found, anchors = _collect(inputs, wanted, issues)
+    try:
+        base = Path(os.path.commonpath(anchors)) if anchors else None
+    except ValueError:  # inputs on different drives
+        base = None
+    seen, count = {}, 0
+    for path in sorted(found, key=lambda p: (str(p).casefold(), str(p))):
+        relative = path.relative_to(base).as_posix() if base else path.as_posix()
+        try:
             asset = fingerprint_file(path, relative)
-            if asset["sha256"] in seen_hashes:
-                report(
-                    "warning",
-                    "duplicate_content",
-                    "Identical bytes; retaining both paths",
-                    path,
-                    first_path=seen_hashes[asset["sha256"]],
-                )
-            seen_hashes.setdefault(asset["sha256"], str(path))
-            assets.append(asset)
-        except (OSError, ValueError, RuntimeError) as error:
-            report("error", "fingerprint_failed", str(error), path)
-    if not assets:
-        report("error", "no_inputs", "No readable video inputs discovered", "")
-    return assets, issues
+        except (OSError, ValueError) as error:
+            _issue(issues, "file_unreadable", f"{type(error).__name__}: {error}", path, "error")
+            continue
+        first = seen.setdefault(asset["sha256"], relative)
+        if first != relative:
+            _issue(issues, "duplicate_content", f"Identical bytes to {first}.", path)
+        count += 1
+        yield asset
+    if not count:
+        _issue(issues, "no_inputs", "No readable video files were found.", severity="error")

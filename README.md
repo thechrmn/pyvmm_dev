@@ -1,180 +1,189 @@
-# PyVMM
+# PyVMM: scientific video metadata, aligned to BeStMeta
 
-Extract local scientific-video metadata, align known fields with
-[BeStMeta](https://github.com/Helmholtz-UFZ/BeStMeta), and retain unmapped metadata.
+Reads the metadata stored inside video files, aligns it with the
+[BeStMeta](https://github.com/Helmholtz-UFZ/BeStMeta) schema (or any JSON Schema),
+validates the result, and writes one JSON document and one spreadsheet. Nothing is
+decoded and nothing is guessed: every value says where it came from, and what the
+files cannot tell you stays visible as *missing*.
 
-| File | Responsibility |
-| --- | --- |
-| `main.py` | Parse options and run the four stages. |
-| `import.py` | Discover files, identify duplicates and calculate SHA-256 fingerprints. |
-| `extract.py` | Run FFprobe with time/output limits; retain raw metadata and derive technical fields. |
-| `align.py` | Merge researcher metadata, report conflicts and optionally validate a local schema. |
-| `export.py` | Stream JSON/CSV into a new output directory; publish both together. |
-
-## Setup
-
-Requires Python 3.11+ and native [FFprobe](https://ffmpeg.org/download.html).
-Keep the environment, data, schemas and results outside this directory. PowerShell:
-
-```powershell
-py -3 -m venv "$env:LOCALAPPDATA\pyvmm-venv"
-$python = "$env:LOCALAPPDATA\pyvmm-venv\Scripts\python.exe"
-& $python -m pip install jsonschema==4.26.0 referencing==0.37.0 rfc3339-validator==0.1.4 rfc3986-validator==0.1.1
-$ffprobe = 'C:\tools\ffmpeg\bin\ffprobe.exe' # Set your installed executable path.
-& $ffprobe -version
+```
+videos/  ->  import.py  ->  extract.py  ->  align.py  ->  export.py  ->  metadata.json + metadata.csv
+             find, hash     FFprobe        map + validate  new folder
 ```
 
-Run from the directory containing the six project files. On Linux,
-use `python3 -m venv`, the environment's `bin/python`, and `ffprobe` on PATH.
-Linux outputs require atomic no-replace directory rename support. In WSL, use a
-Linux output directory, or run Windows Python for output on a Windows drive.
+## Install and run
 
-## Run
+Needs Python 3.11 or newer and `ffprobe` (part of FFmpeg) on your `PATH`.
 
-```powershell
-& $python -B main.py 'D:\videos' -o 'D:\results\run-001' --ffprobe $ffprobe
+```
+pip install -r requirements.txt          # only needed for validation
+python main.py videos/ -o results --metadata my_dataset.json
 ```
 
-Supply files or folders. Folders are searched recursively for common video
-extensions; explicit files are probed regardless of extension. Links and junctions
-are skipped. Repeated paths are processed once; duplicate content is retained and
-reported. Unreadable or corrupt inputs produce diagnostics while other files continue.
-Override folder filtering with `--extensions .mp4,.avi,.mj2`, or use
-`--extensions '*'` to inspect every file. Explicit input files bypass this filter.
-Filtering selects candidates; it does not enable additional demuxers.
+Without `jsonschema` the pipeline still runs and exports drafts; it says so and does not validate.
+`results` must not exist yet; it is never overwritten.
 
-Add researcher context and a local schema when available:
+| Option | Meaning |
+|---|---|
+| `inputs` | video files and/or folders (folders are searched recursively) |
+| `-o, --output` | new output folder (required) |
+| `--metadata FILE` | what you know and the files do not (below) |
+| `--schema FILE` | JSON Schema to validate against (default: bundled BeStMeta) |
+| `--extensions .mp4,.avi` | folder search filter (`*` = every file); named files are always read |
+| `--ffprobe PATH`, `--timeout S`, `--max-output-bytes N` | FFprobe location and per-file limits (60 s, 16 MiB) |
+| `-v` | list files on stderr while they are processed |
 
-```powershell
-& $python -B main.py 'D:\videos\recording.mp4' -o 'D:\results\run-002' --ffprobe $ffprobe --metadata 'D:\study.json' --schema 'D:\schemas\bestmeta.json'
-```
+Exit status:
 
-`--metadata` accepts a UTF-8 JSON object shared by all input files. Use BeStMeta
-field names directly, or this envelope for additional research metadata:
+| Status | Meaning |
+|---|---|
+| 0 | every file read and every record valid |
+| 1 | finished, but some records are drafts or some files had errors; outputs are written |
+| 2 | could not run (bad arguments, FFprobe missing, unreadable metadata, output exists) |
+| 130 | interrupted; nothing is written |
 
+## What you provide
+
+BeStMeta describes a study, not just a file. Most of its required fields (title, licence,
+hardware, recording software) cannot be read from a video. The run summary lists exactly
+which ones are missing (`missing_required`, with counts). Put them in one JSON file:
+
+<!-- example-metadata -->
 ```json
 {
-  "bestmeta": {"dataset_id": "https://example.org/studies/my-study"},
-  "annotations": {"specimen": "sample-01", "capture_rate_hz": 1000}
+  "dataset_title": "Open-field tracking, cohort 3",
+  "dataset_license": "CC-BY-4.0",
+  "hardware_and_acquisition": {
+    "hardware": {
+      "device_type": "in_house_system",
+      "in_house_system_description": "Overhead USB camera above a 40 cm arena",
+      "in_house_system_components": [
+        "USB camera",
+        "LED panel"
+      ],
+      "in_house_system_designer": null,
+      "field_of_view_width": 400,
+      "field_of_view_height": 400,
+      "field_of_view_unit": "mm"
+    },
+    "acquisition": {
+      "recording_software_name": "VendorRec",
+      "recording_software_version": "2.1"
+    }
+  }
 }
 ```
 
-Playback timing is kept separate from acquisition timing; frame counts are never
-estimated. Missing context remains missing. Measured fields take precedence over
-conflicting annotations; JSON retains both values and their provenance. An explicit
-`dataset_id` replaces the generated file identifier.
+* The file is either BeStMeta fields directly (as above) or an envelope with the keys
+  `bestmeta` and `annotations`; `annotations` is free-form context kept next to the record.
+* The same file applies to **every** file of a run. Run once per group of recordings that
+  share their acquisition setup.
+* Duplicate keys, `NaN`, and non-finite numbers are rejected rather than guessed at.
 
-Schemas are optional local files, captured once with their hash and full document.
-`jsonschema` selects the declared draft, or its installed default when `$schema`
-is absent; the active dialect is recorded in the export.
-References within the document work; network retrieval is disabled. Missing or
-unsupported schemas and failed validation produce drafts without discarding metadata.
-Unknown fields survive even when the schema rejects them. Changed field meanings
-require reviewing the mappings in `align.py`. Validation checks declared structure
-and rules, not biological accuracy. Installed standard format checks are enabled;
-unknown/custom formats remain annotations. Patterns use Python regex semantics.
-Codec and container candidates are validated by that schema, without duplicated
-value lists or automatic replacement of unknown values with `other`.
+## Rules that keep records honest
 
-## Results and validation
+* **Measured wins.** Width, height, codec, container, bit depth, colour mode and frame count
+  come from the file. If your metadata disagrees, the measured value stays and the
+  disagreement is listed in `conflicts`; the record is not valid until you resolve it.
+* **Timing is yours to override.** `frame_rate` and `recording_duration` are filled from the
+  file's own timeline, but a time-lapse or high-speed recording is played back at a different
+  rate than it was captured. A value in your metadata replaces them (the file's values stay in
+  `extraction.technical`), and the schema still checks it.
+* **`other` means "not in the schema's list".** `vp9`, Matroska/WebM, MPEG-TS, Ogg, ProRes, DV and
+  others are written as `other` where the schema's enum offers it; the real name stays in
+  `extraction.technical`. Your metadata may say `other` too.
+* **No invented numbers.**
+  * Frame counts are reported only when the container declares one (MP4, AVI, IVF do; Matroska,
+    WebM, MPEG-TS, Ogg usually do not). Count them yourself if you need them, e.g.
+    `ffprobe -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of csv=p=0 FILE`
+    (decodes the video), and add `total_frame_count`.
+  * Raw elementary streams (`.h264`, `.hevc`, `.mjpeg`, `.m4v`, `.m2v`) store no timing; FFprobe
+    reports a default of 25 fps for them, which is not a measurement. Frame rate and duration
+    are therefore left out (`elementary_stream_timing_unknown`) and must come from you.
+  * Bit depth comes from the stream, else from the pixel format's component depth.
+    BeStMeta requires it for FFV1 and raw video.
+  * Recording start time is not taken from the container's `creation_time` (often the time of
+    muxing, not of recording); it stays in `extraction.raw`.
+* **One identifier per file.** `dataset_id` is the SHA-256 of the bytes as an RFC 6920 URI
+  (`ni:///sha-256;...`). Set your own `dataset_id` to group files into a study.
 
-Each new output directory contains:
+## Output
 
-- `metadata.json`: complete records, raw FFprobe sections, aligned metadata,
-  additional annotations, provenance, conflicts, diagnostics, schema and run identity.
-- `metadata.csv`: one row per file; `bestmeta.*`, `technical.*`, `raw.*` and
-  `annotations.*` columns. Arrays occupy JSON cells. Literal `~` and `.` in key
-  components become `~0` and `~1`. Formula-like text is prefixed with an apostrophe
-  for spreadsheet safety. JSON preserves the original values.
+`metadata.json` (complete) and `metadata.csv` (one flattened row per file; formulas are
+neutralised for spreadsheets). The folder appears only when the run is complete.
 
-Existing output paths are refused. Both outputs are staged and published together
-after writing succeeds; failed exports clean up their temporary files when possible.
-
-Exit codes: **0** = every record validated with no errors; **1** = results exported
-with drafts, unvalidated records or input errors; **2** = configuration/export
-failure; **130** = interrupted. A run without a schema normally returns **1**.
-
-To validate with your test videos, run a small representative folder first. This
-check fails if JSON/CSV counts disagree or any source differs from its imported hash:
-
-```powershell
-@'
-import csv
-import hashlib
-import json
-import sys
-from pathlib import Path
-
-output = Path(sys.argv[1])
-report = json.loads((output / "metadata.json").read_text(encoding="utf-8"))
-records = report["records"]
-csv.field_size_limit(2**31 - 1)  # Portable C long limit for large metadata cells.
-with (output / "metadata.csv").open(encoding="utf-8-sig", newline="") as stream:
-    rows = sum(1 for _ in csv.DictReader(stream))
-if not records or len(records) != report["summary"]["files"] or rows != len(records):
-    raise SystemExit("Export counts do not agree, or no files were exported.")
-for record in records:
-    asset = record["extraction"]["asset"]
-    with Path(asset["path"]).open("rb") as stream:
-        digest = hashlib.file_digest(stream, "sha256").hexdigest()
-    if digest != asset["sha256"]:
-        raise SystemExit(f"Source hash changed: {asset['path']}")
-    print(json.dumps({
-        "file": asset["relative_path"],
-        "validation": record["validation"],
-        "issues": record["issues"],
-    }, indent=2))
-print(json.dumps({
-    "summary": report["summary"],
-    "import_issues": report["import_issues"],
-}, indent=2))
-print("File counts and source hashes verified.")
-'@ | & $python -B - 'D:\results\run-001'
+```
+run            software, Python, FFprobe version and arguments
+schema         path, sha256, dialect, status
+records[]      per file:
+  extraction.asset      path, relative_path, size_bytes, mtime_ns, sha256
+  extraction.raw        FFprobe format/streams/chapters/programs, unchanged
+  extraction.technical  normalised values, with *_source fields saying where they came from
+  bestmeta              the aligned record
+  annotations           your free-form context
+  provenance            for every BeStMeta path: each candidate value, its source, method, and whether it was selected
+  conflicts             measured vs supplied disagreements
+  issues                everything noteworthy: severity, code, message, stage
+  validation            valid, schema_valid, schema_status, errors, missing_required
+import_issues  problems found while locating files
+summary        files, valid, draft, errors, success, missing_required (counts)
 ```
 
-This check allows draft records; review the reported validation and input errors.
-Compare `technical` with a direct FFprobe inspection and independently known
-dimensions, reported counts and playback timing. Check unknown fields in JSON
-and CSV, and review every conflict and validation error. Repeat with no schema,
-your current schema and an updated schema: evidence must remain present in all
-three outputs. Include a corrupt file and an unavailable input to confirm that
-good recordings still export. Reusing an output path must fail without changing it.
+Output is deterministic: the same inputs give the same bytes (no timestamps).
+`error` issues mean a file's evidence is unusable; whether metadata fits the schema is reported in
+`validation` and `draft`, so `summary.errors` counts unreadable files, not incomplete metadata.
+`valid` means schema-valid, no conflicts, and no `error` issues.
 
-FFprobe reads metadata; it does not certify that every frame decodes. When needed,
-check the video separately using FFmpeg:
+| Issue | Severity | Meaning |
+|---|---|---|
+| `input_not_found`, `input_unsupported`, `folder_unreadable`, `file_unreadable` | error | an input could not be used |
+| `no_inputs` | error | nothing readable was found |
+| `symlink_skipped` | warning | a link inside a searched folder was not followed (links you name are followed) |
+| `duplicate_content` | warning | identical bytes to another file |
+| `ffprobe_failed`, `ffprobe_timeout`, `ffprobe_output_limit`, `ffprobe_unavailable`, `invalid_probe_json` | error | the file could not be read |
+| `input_changed` | error | the file changed while it was processed; nothing from it is trusted |
+| `video_stream_not_found` | error | no video stream (cover art does not count) |
+| `ffprobe_diagnostic` | warning | text FFprobe printed on stderr |
+| `multiple_video_streams` | warning | the default stream, else the first, was used |
+| `nominal_frame_rate`, `possible_variable_frame_rate` | warning | rate source or constancy is uncertain |
+| `implausible_average_frame_rate` | warning | the average exceeded the base rate (seen with DV); the base rate was used |
+| `duration_mismatch`, `container_duration_fallback`, `video_duration_ambiguous` | warning | duration source notes; ambiguous means none is reported |
+| `elementary_stream_timing_unknown` | warning | raw stream: no timing reported |
+| `technical_value_unavailable` | warning | width, height, rate or duration could not be determined |
+| `jsonschema_not_installed`, `schema_unavailable`, `schema_validation_unavailable` | warning | validation could not run; records are drafts |
+| `metadata_conflict`, `bestmeta_validation_failed` | warning | your metadata disagrees with the file / the schema rejects the record |
 
-```powershell
-& 'C:\tools\ffmpeg\bin\ffmpeg.exe' -v error -xerror -i 'D:\videos\recording.mp4' -map '0:v:0' -f null -
+## Safety
+
+FFprobe runs with a time limit, an output cap, a file-only protocol whitelist and a demuxer
+whitelist. The whitelist matters for correctness as well as security: a text file that merely
+*names* another video (a concat or playlist script) would otherwise be described as that
+video. Remote `$ref`s in schemas are never fetched. Links found inside searched folders are not
+followed. File names are never interpreted by a shell.
+
+## Limits
+
+* Video containers FFmpeg can read. HDF5 and image sequences (also listed by BeStMeta) are not
+  read; replace `extract.py` for them (the stages only exchange plain dictionaries).
+* Metadata is read, not verified: files are not decoded.
+* `import.py` is named as requested; `main.py` loads it with `importlib` because `import` is a
+  Python keyword. No other module imports it.
+* Developed and tested on Linux with FFmpeg 6.1 and Python 3.12. `.github/workflows/test.yml` runs the
+  suite on Linux, macOS and Windows; macOS and Windows have not been exercised by the author.
+
+## Adapting
+
+* Other schema: `--schema FILE` plus a matching `FIELD_MAP` in `align.py` (technical key to a
+  destination path). Only `date`, `date-time` and `uri` formats are asserted.
+* More containers: add the demuxer name to `DEMUXERS` in `extract.py`.
+* Other metadata sources: a stage is any function with the same dictionaries in and out.
+
+## Development
+
+```
+python -m unittest                       # needs ffmpeg and ffprobe to build test videos
 ```
 
-Probing defaults to 60 seconds and 16 MiB combined stdout/stderr per file;
-override with `--timeout 120 --max-output-bytes 33554432`.
-Allowed self-contained demuxers are listed in `extract.py`.
-Inputs must be local, self-contained media. Unsupported inputs retain their file
-identity and failure diagnostics.
-Probe JSON is limited to 64 nesting levels. Rejected JSON bytes remain in
-`extraction.tool.unparsed_stdout_base64`; the remaining files still export.
-
-## Adapt the pipeline
-
-Stages exchange JSON-compatible dictionaries: `import_files` returns assets and
-issues; `extract_metadata` returns `asset`, `raw`, `technical`, `tool` and `issues`;
-`align_metadata` returns a record; `export_metadata` accepts an iterable of records.
-Keep these contracts when replacing a stage. Extraction owns backend interpretation;
-alignment owns field meanings; export owns serialization.
-
-The seven standard technical-field projections are defined once in `align.FIELD_MAP`.
-Override them per call using tuples of destination keys, for example:
-
-```python
-from align import FIELD_MAP, align_metadata
-
-mapping = {**FIELD_MAP, "height": ("image", "height_px")}
-record = align_metadata(extraction, field_map=mapping)
-```
-
-An empty map disables these projections. Raw and technical metadata remain intact.
-Overlapping paths are rejected; literal dots and tildes in keys are supported.
-Acquisition timing still requires independently supplied context.
-After updating Python, FFprobe, dependencies, schemas or mappings, rerun the
-validation checks above.
+The suite generates its videos with ffmpeg, so no binary files are stored. See
+`schemas/README.md` for the bundled schema and how to update it, and
+`docs/LIBRARY_EVALUATION.md` for why FFprobe and `jsonschema` were chosen.

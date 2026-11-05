@@ -1,441 +1,312 @@
-"""Read local video metadata without decoding or inventing acquisition facts."""
+"""Stage 2 - read container and stream metadata with FFprobe.
 
-import base64
+Nothing is decoded and nothing is guessed: a value is reported only when FFprobe
+states it, and its source is recorded. FFprobe runs with a deadline, an output cap
+and a demuxer whitelist (a text file that merely *names* another file, such as a
+concat script, would otherwise make FFprobe describe that other file).
+"""
+
+import functools
 import json
-import math
 import os
 import re
 import shutil
-import stat
 import subprocess
-import time
+import threading
 from fractions import Fraction
-from importlib import import_module
 from pathlib import Path
 
-file_identity = import_module("import").file_identity
-SUPPORTED_DEMUXERS = (
-    "3g2 3gp aac asf avi flv h264 hevc m4a m4v matroska mj2 mjpeg mov mp3 mp4 "
-    "mpeg mpegts mpegvideo mxf nut ogg wav webm"
+MAX_OUTPUT_BYTES = 16 * 1024 * 1024
+DEMUXERS = (
+    "3g2 3gp aac asf avi dv flv h264 hevc ivf m4a m4v matroska mj2 mjpeg mov mp3 mp4 "
+    "mpeg mpegts mpegvideo mxf nut ogg wav webm yuv4mpegpipe"
 ).split()
-_SECTIONS = ("format", "streams", "chapters", "programs", "program_version", "library_versions")
+PROBE_ARGUMENTS = (
+    *("-v", "warning", "-protocol_whitelist", "file", "-format_whitelist", ",".join(DEMUXERS)),
+    *("-print_format", "json", "-show_format", "-show_streams", "-show_chapters", "-show_programs"),
+)
+_SECTIONS = ("format", "streams", "chapters", "programs")
+_WINDOWS = os.name == "nt"
+# Elementary streams store no timing: FFprobe fills in a default (25 fps) that is not a measurement.
+_UNTIMED = frozenset({"h264", "hevc", "m4v", "mjpeg", "mpegvideo"})
+_NUMBER = re.compile(r"-?[0-9]+(\.[0-9]+)?(/[0-9]+)?")
+_ADDRESS = re.compile(r" @ 0x[0-9a-fA-F]+")  # FFmpeg log prefix; differs on every run
 
 
-class ProbeFailure(Exception):
-    """An operational probe failure, reported on the affected file."""
+class ProbeError(Exception):
+    """FFprobe could not be run to completion; ``code`` becomes the issue code."""
 
     def __init__(self, code, message):
         super().__init__(message)
         self.code = code
 
 
-def _pipe_reader(pipes):
-    """Read both pipes without leaving blocked threads after cancellation."""
-    if os.name != "nt":
-        for pipe in pipes:
-            os.set_blocking(pipe.fileno(), False)
+def _run(command, timeout, limit):
+    """Run ``command``; return (exit code, stdout, stderr) or raise ProbeError.
 
-        def read(pipe, amount):
-            try:
-                return os.read(pipe.fileno(), amount)
-            except BlockingIOError:
-                return None
-
-        return read
-
-    import ctypes
-    import msvcrt
-    from ctypes import wintypes
-
-    peek = ctypes.WinDLL("kernel32", use_last_error=True).PeekNamedPipe
-    peek.argtypes = [
-        wintypes.HANDLE,
-        wintypes.LPVOID,
-        wintypes.DWORD,
-        wintypes.LPDWORD,
-        wintypes.LPDWORD,
-        wintypes.LPDWORD,
-    ]
-    peek.restype = wintypes.BOOL
-
-    def read(pipe, amount):
-        available = wintypes.DWORD()
-        if not peek(
-            msvcrt.get_osfhandle(pipe.fileno()), None, 0, None, ctypes.byref(available), None
-        ):
-            error = ctypes.get_last_error()
-            if error in (109, 233):
-                return b""
-            raise OSError(error, "PeekNamedPipe failed")
-        return os.read(pipe.fileno(), min(amount, available.value)) if available.value else None
-
-    return read
-
-
-def _run_bounded(command, timeout, limit):
-    """Limit elapsed time and combined stdout/stderr, including inherited writers."""
-    if (
-        isinstance(timeout, bool)
-        or not isinstance(timeout, (int, float))
-        or not math.isfinite(timeout)
-        or timeout <= 0
-    ):
-        raise ValueError("timeout must be a finite positive number")
-    if type(limit) is not int or limit <= 0:
-        raise ValueError("output limit must be a positive integer")
-    deadline = time.monotonic() + timeout
+    ``timeout`` is seconds for the whole run; ``limit`` caps bytes per output stream.
+    The process is always killed and reaped when the caller leaves, interrupts included.
+    """
     try:
         process = subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            shell=False,
-            bufsize=0,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
     except OSError as error:
-        code = (
-            "ffprobe_not_found" if isinstance(error, FileNotFoundError) else "ffprobe_launch_failed"
-        )
-        raise ProbeFailure(code, str(error)) from error
-    pipes = [process.stdout, process.stderr]
-    buffers, open_pipes, output_bytes = [bytearray(), bytearray()], {0, 1}, 0
+        raise ProbeError("ffprobe_unavailable", f"Cannot start FFprobe: {error}") from error
+    captured, overflow = {}, threading.Event()
+
+    def drain(name, pipe):
+        chunks, size = [], 0
+        for chunk in iter(lambda: pipe.read(65536), b""):
+            size += len(chunk)
+            if size > limit:
+                overflow.set()
+                process.kill()
+                break
+            chunks.append(chunk)
+        captured[name] = b"".join(chunks)
+
+    readers = [
+        threading.Thread(target=drain, args=pair, daemon=True)
+        for pair in (("stdout", process.stdout), ("stderr", process.stderr))
+    ]
+    for reader in readers:
+        reader.start()
+    timed_out = False
     try:
-        read = _pipe_reader(pipes)
-        while open_pipes or process.poll() is None:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise ProbeFailure("ffprobe_timeout", f"FFprobe exceeded {timeout:g} seconds.")
-            progress = False
-            for index in tuple(open_pipes):
-                chunk = read(pipes[index], min(65536, limit - output_bytes + 1))
-                if chunk is None:
-                    continue
-                progress = True
-                if not chunk:
-                    open_pipes.remove(index)
-                elif output_bytes + len(chunk) > limit:
-                    raise ProbeFailure(
-                        "ffprobe_output_limit", f"FFprobe exceeded {limit} output bytes."
-                    )
-                else:
-                    buffers[index].extend(chunk)
-                    output_bytes += len(chunk)
-            if not progress:
-                time.sleep(min(0.01, remaining))
-        return process.returncode, bytes(buffers[0]), bytes(buffers[1])
-    except OSError as error:
-        raise ProbeFailure("ffprobe_read_failed", str(error)) from error
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
     finally:
-        try:
-            if process.poll() is None:
-                try:
-                    process.kill()
-                except ProcessLookupError:
-                    pass
-            process.wait()
-        finally:
-            for pipe in pipes:
-                pipe.close()
-
-
-def _native_tool(executable):
-    if os.name == "nt" and Path(executable).suffix.lower() in {".bat", ".cmd"}:
-        raise ValueError("Use a native FFprobe executable, not a batch script.")
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+        for reader in readers:
+            reader.join(timeout=2)  # a wrapper script's orphaned child may hold the pipes
+        process.stdout.close()
+        process.stderr.close()
+    if timed_out:
+        raise ProbeError("ffprobe_timeout", f"FFprobe did not finish within {timeout} s.")
+    if overflow.is_set():
+        raise ProbeError("ffprobe_output_limit", f"FFprobe printed more than {limit} bytes.")
+    return process.returncode, captured.get("stdout", b""), captured.get("stderr", b"")
 
 
 def inspect_ffprobe(ffprobe="ffprobe", *, timeout=10):
-    """Return a resolved native backend and version, or raise ValueError before import."""
+    """Resolve and check the FFprobe executable; raise ValueError if it is unusable."""
     executable = shutil.which(os.fspath(ffprobe))
     if executable is None:
         raise ValueError(f"FFprobe executable not found: {ffprobe}")
     executable = str(Path(executable).resolve(strict=True))
-    _native_tool(executable)
+    if _WINDOWS and Path(executable).suffix.lower() in {".bat", ".cmd"}:
+        raise ValueError("Use a native FFprobe executable, not a batch script.")
     try:
-        code, output, diagnostic = _run_bounded([executable, "-version"], timeout, 65536)
-    except ProbeFailure as error:
-        raise ValueError(f"Cannot inspect FFprobe: {error}") from error
+        code, output, error = _run([executable, "-version"], timeout, 65536)
+    except ProbeError as failure:
+        raise ValueError(f"Cannot inspect FFprobe: {failure}") from failure
     lines = output.decode("utf-8", errors="replace").splitlines()
-    match = re.fullmatch(r"ffprobe version (\S+)(?: .*|)", lines[0]) if lines else None
+    match = re.match(r"ffprobe version (\S+)", lines[0]) if lines else None
     if code or match is None:
         raise ValueError(
-            f"Not a working FFprobe: {executable}. "
-            + diagnostic.decode("utf-8", errors="replace")[:500]
+            f"Not a working FFprobe: {executable}. {error.decode('utf-8', 'replace')[:300]}"
         )
     return {
-        "name": "ffprobe",
         "executable": executable,
         "version": match[1],
         "banner": lines[0],
+        "arguments": list(PROBE_ARGUMENTS),
     }
 
 
-def _fraction(value, *, allow_zero=False, signed=False):
-    if value is None or isinstance(value, bool):
-        return None
-    text = str(value).strip()
-    if len(text) > 128:
-        return None
-    exponent = re.search(r"[eE]([+-]?\d+)$", text)
-    if exponent and abs(int(exponent[1])) > 400:
-        return None
+@functools.lru_cache(maxsize=4)
+def _component_depths(ffprobe):
+    """{pixel format: bit depth} for formats whose colour components share one depth."""
+    command = [ffprobe, "-v", "error", "-show_pixel_formats", "-print_format", "json"]
     try:
-        result = Fraction(text)
-        number = float(result)
-    except (ValueError, ZeroDivisionError, OverflowError):
-        return None
-    if not math.isfinite(number) or (number == 0 and result != 0):
-        return None
-    return result if signed or (result > 0 or (allow_zero and result == 0)) else None
-
-
-def _integer(value, *, allow_zero=False):
-    number = _fraction(value, allow_zero=allow_zero)
-    return number.numerator if number is not None and number.denominator == 1 else None
+        code, output, _ = _run(command, 30, MAX_OUTPUT_BYTES)
+        formats = [] if code else json.loads(output.decode("utf-8")).get("pixel_formats", [])
+    except (ProbeError, ValueError):
+        return {}
+    depths = {}
+    for pixel_format in formats:
+        values = {c.get("bit_depth") for c in pixel_format.get("components", [])}
+        if len(values) == 1 and None not in values:
+            depths[pixel_format["name"]] = values.pop()
+    return depths
 
 
 def _issue(issues, code, message, severity="warning"):
-    issues.append(dict(severity=severity, code=code, message=message, stage="extract"))
+    issues.append({"severity": severity, "code": code, "message": message, "stage": "extract"})
 
 
-def _technical(raw, issues):
-    streams = raw.get("streams", [])
-    if not isinstance(streams, list) or any(not isinstance(s, dict) for s in streams):
-        raise ValueError("FFprobe streams must be a list of objects.")
-    indices = [s.get("index") for s in streams]
-    if any(type(i) is not int or i < 0 for i in indices) or len(set(indices)) != len(indices):
-        raise ValueError("FFprobe stream indices must be unique nonnegative integers.")
-    for stream in streams:
-        flags = stream.get("disposition", {})
-        if not isinstance(flags, dict) or any(
-            type(flags.get(k, 0)) is not int or flags.get(k, 0) not in (0, 1)
-            for k in ("attached_pic", "default")
-        ):
-            raise ValueError("FFprobe dispositions must contain integer 0/1 flags.")
-    videos = [
-        s
-        for s in streams
-        if s.get("codec_type") == "video" and not s.get("disposition", {}).get("attached_pic")
-    ]
-    if not videos:
-        _issue(issues, "video_stream_not_found", "No eligible video stream found.", "error")
-        return {}
-    if len(videos) > 1:
-        _issue(
-            issues, "multiple_video_streams", "Selected default video, then lowest stream index."
-        )
-    stream = min(videos, key=lambda s: (not s.get("disposition", {}).get("default"), s["index"]))
-    result = {"stream_index": stream["index"]}
-    for key in ("width", "height"):
-        number = _integer(stream.get(key))
-        if number is not None:
-            result[key] = number
-    for source, target in (("codec_name", "codec"), ("pix_fmt", "pixel_format")):
-        if isinstance(stream.get(source), str) and stream[source]:
-            result[target] = stream[source]
-    format_data = raw.get("format", {})
-    if not isinstance(format_data, dict):
-        raise ValueError("FFprobe format must be an object.")
-    if isinstance(format_data.get("format_name"), str):
-        result["container"] = format_data["format_name"]
+def _number(value, *, signed=False):
+    """Exact Fraction from FFprobe text such as '30000/1001' or '2.002', else None."""
+    text = str(value).strip() if value is not None and not isinstance(value, bool) else ""
+    if not _NUMBER.fullmatch(text):
+        return None
+    try:
+        number = Fraction(text)
+    except ZeroDivisionError:  # FFprobe prints unknown rates as 0/0
+        return None
+    return number if signed or number >= 0 else None
 
-    average, nominal = (_fraction(stream.get(k)) for k in ("avg_frame_rate", "r_frame_rate"))
+
+def _integer(value):
+    number = _number(value)
+    return int(number) if number is not None and number.denominator == 1 else None
+
+
+def _flag(stream, name):
+    return bool(stream.get("disposition", {}).get(name))
+
+
+def _frame_rate(stream, issues):
+    average, nominal = _number(stream.get("avg_frame_rate")), _number(stream.get("r_frame_rate"))
+    if average and nominal:
+        if average > nominal * Fraction(101, 100):
+            # r_frame_rate is the base rate all timestamps are multiples of: no average can exceed it.
+            _issue(issues, "implausible_average_frame_rate", "Average rate exceeds the base rate; base rate kept.")
+            average = None
+        elif average != nominal:
+            _issue(issues, "possible_variable_frame_rate", "Rates differ; constant rate is unverified.")
+    elif nominal:
+        _issue(issues, "nominal_frame_rate", "Average rate missing; nominal rate retained.")
     rate = average or nominal
-    if rate is not None:
-        source = "stream.avg_frame_rate" if average else "stream.r_frame_rate"
-        result.update(
-            frame_rate=float(rate),
-            frame_rate_rational=str(rate.numerator) + "/" + str(rate.denominator),
-            frame_rate_source=source,
-        )
-        if average is None:
-            _issue(issues, "nominal_frame_rate", "Average rate missing; nominal rate retained.")
-        elif nominal is not None and nominal != average:
-            _issue(
-                issues,
-                "possible_variable_frame_rate",
-                "Rates differ; constant-rate timing is unverified.",
-            )
+    if not rate:
+        return {}
+    source = "stream.avg_frame_rate" if average else "stream.r_frame_rate"
+    return {"frame_rate": float(rate), "frame_rate_source": source}
 
-    ticks = _integer(stream.get("duration_ts"), allow_zero=True)
-    base = _fraction(stream.get("time_base"))
-    exact = ticks * base if ticks is not None and base is not None else None
-    reported = _fraction(stream.get("duration"), allow_zero=True)
-    if (
-        exact is not None
-        and reported is not None
-        and abs(exact - reported) > Fraction(1, 1_000_000)
-    ):
-        _issue(
-            issues,
-            "duration_mismatch",
-            "Duration reports differ; exact timestamp duration retained.",
-        )
+
+def _container_duration(raw, issues):
+    """The container's duration, only when it can belong to the video stream (else None)."""
+    total = _number(raw.get("format", {}).get("duration"))
+    if total is None:
+        return None
+    timed = [s for s in raw["streams"] if s.get("codec_type") != "attachment" and not _flag(s, "attached_pic")]
+    if len(timed) == 1:
+        _issue(issues, "container_duration_fallback", "Single-stream container duration kept.")
+        return total
+    _issue(issues, "video_duration_ambiguous", "Container duration cannot be assigned to video.")
+    return None
+
+
+def _duration(stream, raw, issues):
+    ticks, base = _integer(stream.get("duration_ts")), _number(stream.get("time_base"))
+    exact = ticks * base if ticks is not None and base else None
+    reported = _number(stream.get("duration"))
+    if exact is not None and reported is not None and abs(exact - reported) > Fraction(1, 10**6):
+        _issue(issues, "duration_mismatch", "Duration reports differ; timestamp duration kept.")
     duration = exact if exact is not None else reported
     source = "stream.duration_ts*time_base" if exact is not None else "stream.duration"
     if duration is None:
-        container = _fraction(format_data.get("duration"), allow_zero=True)
-        if container is not None:
-            result["container_duration_seconds"] = float(container)
-            timed = sum(
-                s.get("codec_type") != "attachment"
-                and not s.get("disposition", {}).get("attached_pic")
-                for s in streams
-            )
-            if timed == 1:
-                duration, source = container, "format.duration"
-                _issue(
-                    issues,
-                    "container_duration_fallback",
-                    "Single-stream container duration retained.",
-                )
-            else:
-                _issue(
-                    issues,
-                    "video_duration_ambiguous",
-                    "Container duration cannot establish this stream's duration.",
-                )
-    if duration is not None:
-        try:
-            number = float(duration)
-            if math.isfinite(number) and (number != 0 or duration == 0):
-                result.update(
-                    duration_seconds=number,
-                    duration_rational=f"{duration.numerator}/{duration.denominator}",
-                    duration_source=source,
-                )
-        except OverflowError:
-            pass
-    for key, target in (("nb_frames", "frame_count"), ("bits_per_raw_sample", "bit_depth")):
-        number = _integer(stream.get(key), allow_zero=key == "nb_frames")
-        if number is not None:
-            result[target] = number
-            if key == "nb_frames":
-                result["frame_count_source"] = "stream.nb_frames"
-    start = _fraction(stream.get("start_time"), allow_zero=True, signed=True)
+        duration, source = _container_duration(raw, issues), "format.duration"
+    if duration is None:
+        return {}
+    return {"duration_seconds": float(duration), "duration_source": source}
+
+
+def _select_video(raw, issues):
+    """The video stream to describe: the default one, else the first. Cover art is not video."""
+    videos = [
+        s for s in raw.get("streams", []) if s.get("codec_type") == "video" and not _flag(s, "attached_pic")
+    ]
+    if not videos:
+        _issue(issues, "video_stream_not_found", "No video stream found.", "error")
+        return None
+    if len(videos) > 1:
+        _issue(issues, "multiple_video_streams", "Selected the default video stream, else the first.")
+    return min(videos, key=lambda s: (not _flag(s, "default"), s["index"]))
+
+
+def _stream_values(stream, container):
+    """Values FFprobe states directly for the stream; an unusable value is left out."""
+    result = {"stream_index": stream["index"]}
+    for key, source in (("width", "width"), ("height", "height"), ("bit_depth", "bits_per_raw_sample")):
+        number = _integer(stream.get(source))
+        if number:  # a size or depth of 0 is not usable
+            result[key] = number
+    if "bit_depth" in result:
+        result["bit_depth_source"] = "stream.bits_per_raw_sample"
+    frames = _integer(stream.get("nb_frames"))
+    if frames is not None:  # 0 frames is a legitimate declared count
+        result["frame_count"] = frames
+    for key, source in (("codec", "codec_name"), ("pixel_format", "pix_fmt")):
+        if isinstance(stream.get(source), str) and stream[source]:
+            result[key] = stream[source]
+    if isinstance(container.get("format_name"), str):
+        result["container"] = container["format_name"]
+    start = _number(stream.get("start_time"), signed=True)
     if start is not None:
         result["start_time_seconds"] = float(start)
-    pixel_format = result.get("pixel_format", "")
+    return result
+
+
+def _pixel_facts(result, pixel_depths):
+    """Bit depth (when the stream does not declare it) and colour mode, from the pixel format."""
+    pixel_format, facts = result.get("pixel_format", ""), {}
+    if "bit_depth" not in result and pixel_format in pixel_depths():
+        facts["bit_depth"] = pixel_depths()[pixel_format]
+        facts["bit_depth_source"] = "ffprobe_pixel_format.component_depth"
     if pixel_format.startswith(("gray", "mono")):
-        result["color_mode"] = "grayscale"
+        facts["color_mode"] = "grayscale"
     elif pixel_format.startswith(("rgb", "bgr", "gbr")):
-        result["color_mode"] = "rgb"
-    for key in ("width", "height", "frame_rate", "duration_seconds"):
+        facts["color_mode"] = "rgb"
+    return facts
+
+
+def _technical(raw, issues, pixel_depths):
+    """Normalised values for the selected video stream; unknown values stay absent."""
+    stream = _select_video(raw, issues)
+    if stream is None:
+        return {}
+    result = _stream_values(stream, raw.get("format", {}))
+    untimed = bool(_UNTIMED.intersection(result.get("container", "").split(",")))
+    if untimed:
+        _issue(issues, "elementary_stream_timing_unknown", "Raw stream: frame rate and duration are not stored.")
+    else:
+        result.update(_frame_rate(stream, issues))
+        result.update(_duration(stream, raw, issues))
+    result.update(_pixel_facts(result, pixel_depths))
+    for key in ("width", "height") + (() if untimed else ("frame_rate", "duration_seconds")):
         if key not in result:
             _issue(issues, "technical_value_unavailable", f"No usable {key} reported.")
     return result
 
 
-def _decode_probe(output):
-    def check_depth(value, depth=0):
-        if isinstance(value, (dict, list)):
-            if depth >= 64:
-                raise ValueError("FFprobe JSON exceeds 64 nesting levels.")
-            for child in value.values() if isinstance(value, dict) else value:
-                check_depth(child, depth + 1)
-
-    def constant(value):
-        raise ValueError(f"Nonfinite JSON constant: {value}")
-
-    def number(token):
-        value = float(token)
-        if not math.isfinite(value) or (
-            value == 0 and any(c in "123456789" for c in token.lower().partition("e")[0])
-        ):
-            raise ValueError("JSON number is nonfinite or underflows to zero")
-        return value
-
-    def pairs(values):
-        result = {}
-        for key, value in values:
-            if key in result:
-                raise ValueError(f"Duplicate JSON key: {key}")
-            result[key] = value
-        return result
-
-    raw = json.loads(
-        output.decode("utf-8"),
-        parse_constant=constant,
-        parse_float=number,
-        object_pairs_hook=pairs,
-    )
-    if not isinstance(raw, dict):
-        raise ValueError("FFprobe response must be an object.")
-    check_depth(raw)
-    return raw
+def _changed(asset):
+    try:
+        info = Path(asset["path"]).stat()
+    except OSError:
+        return True
+    return (info.st_size, info.st_mtime_ns) != (asset["size_bytes"], asset["mtime_ns"])
 
 
-def extract_metadata(asset, *, ffprobe="ffprobe", timeout=60, max_output_bytes=16_777_216):
-    """Return raw/technical metadata and diagnostics for one fingerprinted asset.
+def extract_metadata(asset, *, ffprobe="ffprobe", timeout=60, max_output_bytes=MAX_OUTPUT_BYTES):
+    """Probe one asset; never raises for bad media, reports problems as issues.
 
-    Backend failures stay in the record; timeout and output limits bound each probe.
+    Returns ``{"asset", "raw", "technical", "issues"}``. ``raw`` holds FFprobe's
+    format, streams, chapters and programs unchanged.
     """
-    executable = os.fspath(ffprobe)
-    _native_tool(executable)
-    result = {
-        "asset": dict(asset),
-        "raw": {},
-        "technical": {},
-        "issues": [],
-        "tool": {"name": "ffprobe", "executable": executable},
-    }
-    issues, tool = result["issues"], result["tool"]
+    issues, raw, technical = [], {}, {}
+    command = [ffprobe, *PROBE_ARGUMENTS, "-i", asset["path"]]
     try:
-        path = Path(asset["path"]).resolve(strict=True)
-        before = path.stat()
-        if not stat.S_ISREG(before.st_mode):
-            raise ValueError("Input is not a regular file.")
-        if any(asset.get(k, v) != v for k, v in file_identity(before).items()):
-            _issue(issues, "input_changed", "Input changed after import.", "error")
-            return result
-    except (OSError, KeyError, TypeError, ValueError, RuntimeError) as error:
-        _issue(issues, "input_unavailable", str(error), "error")
-        return result
-    command = [
-        executable,
-        "-v",
-        "warning",
-        "-protocol_whitelist",
-        "file",
-        "-format_whitelist",
-        ",".join(SUPPORTED_DEMUXERS),
-        "-print_format",
-        "json",
-    ]
-    command += ["-show_" + section for section in _SECTIONS] + ["-i", str(path)]
-    tool["command"] = command
-    try:
-        code, output, diagnostic = _run_bounded(command, timeout, max_output_bytes)
-        if diagnostic:
-            tool["stderr"] = diagnostic.decode("utf-8", errors="replace")
-            _issue(issues, "ffprobe_diagnostic", "See tool.stderr for probe diagnostics.")
+        code, output, diagnostic = _run(command, timeout, max_output_bytes)
+        text = _ADDRESS.sub("", diagnostic.decode("utf-8", errors="replace")).strip()
+        if text:
+            _issue(issues, "ffprobe_diagnostic", text[:1000])
         if code:
-            _issue(
-                issues,
-                "ffprobe_failed",
-                f"FFprobe exited with code {code}: " + tool.get("stderr", "")[:2000],
-                "error",
-            )
-        if output.strip():
-            try:
-                result["raw"] = _decode_probe(output)
-                result["technical"] = _technical(result["raw"], issues)
-                version = result["raw"].get("program_version", {})
-                if isinstance(version, dict):
-                    tool["version"] = version.get("version")
-            except (UnicodeError, ValueError, TypeError, AttributeError, RecursionError) as error:
-                tool["unparsed_stdout_base64"] = base64.b64encode(output).decode("ascii")
-                _issue(issues, "invalid_probe_json", str(error), "error")
-        elif not code:
-            _issue(issues, "invalid_probe_json", "FFprobe returned no JSON.", "error")
-    except ProbeFailure as error:
-        _issue(issues, error.code, str(error), "error")
-    finally:
-        try:
-            after = path.stat()
-            if not stat.S_ISREG(after.st_mode) or file_identity(before) != file_identity(after):
-                raise ValueError("Input changed during extraction.")
-        except (OSError, ValueError) as error:
-            _issue(issues, "input_changed", str(error), "error")
-    return result
+            _issue(issues, "ffprobe_failed", f"FFprobe exited with status {code}.", "error")
+        else:
+            parsed = json.loads(output.decode("utf-8"))
+            raw = {key: parsed[key] for key in _SECTIONS if key in parsed}
+            technical = _technical(raw, issues, lambda: _component_depths(ffprobe))
+    except ProbeError as failure:
+        _issue(issues, failure.code, str(failure), "error")
+    except (ValueError, KeyError, TypeError, AttributeError) as error:
+        raw, technical = {}, {}
+        _issue(issues, "invalid_probe_json", f"{type(error).__name__}: {error}", "error")
+    if _changed(asset):
+        raw, technical = {}, {}
+        _issue(issues, "input_changed", "File changed since it was fingerprinted.", "error")
+    return {"asset": dict(asset), "raw": raw, "technical": technical, "issues": issues}
