@@ -1,6 +1,9 @@
 import hashlib
 import os
+import stat
+import types
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from tests.support import TempDirCase, importer
@@ -179,7 +182,7 @@ class DiscoveryTests(TempDirCase):
 class EdgeCases(TempDirCase):
     def test_a_path_that_cannot_be_inspected_is_not_a_link(self):
         with mock.patch.object(importer.Path, "lstat", side_effect=PermissionError):
-            self.assertFalse(importer._is_link(self.tmp))
+            self.assertIs(importer._is_link(self.tmp), False)
 
     @unittest.skipUnless(hasattr(os, "mkfifo"), "needs named pipes")
     def test_inputs_that_are_neither_files_nor_folders_are_reported(self):
@@ -194,6 +197,68 @@ class EdgeCases(TempDirCase):
             assets, _ = run([self.tmp / "a", self.tmp / "b"])
         self.assertEqual([a["relative_path"] for a in assets], [(self.tmp / "a/x.mp4").resolve().as_posix(),
                                                                (self.tmp / "b/y.mp4").resolve().as_posix()])
+
+    def test_windows_mount_points_count_as_links_but_other_reparse_points_do_not(self):
+        def inspect(mode, tag=None):
+            info = types.SimpleNamespace(st_mode=mode)
+            if tag is not None:
+                info.st_reparse_tag = tag
+            with mock.patch.object(importer.Path, "lstat", return_value=info):
+                return importer._is_link(self.tmp)
+
+        self.assertIs(inspect(stat.S_IFDIR, 0xA0000003), True)  # IO_REPARSE_TAG_MOUNT_POINT (junction)
+        self.assertIs(inspect(stat.S_IFDIR, 0x9000001A), False)  # e.g. a cloud-storage placeholder
+        self.assertIs(inspect(stat.S_IFDIR, 0), False)
+        self.assertIs(inspect(stat.S_IFDIR), False)  # POSIX: the attribute does not exist
+        self.assertIs(inspect(stat.S_IFLNK), True)
+        self.assertIs(inspect(stat.S_IFREG), False)
+
+    def test_junctions_are_never_descended_into(self):
+        write(self.tmp / "data/junction/inside.mp4", b"1")
+        write(self.tmp / "data/plain/ok.mp4", b"2")
+        real = importer._is_link
+        with mock.patch.object(importer, "_is_link", lambda path: path.name == "junction" or real(path)):
+            assets, issues = run([self.tmp / "data"])
+        self.assertEqual([a["relative_path"] for a in assets], ["plain/ok.mp4"])
+        self.assertEqual(codes(issues), ["symlink_skipped"])
+        self.assertTrue(issues[0]["path"].endswith("junction"))
+
+    def test_names_sort_without_regard_to_case(self):
+        for name in ("B.mp4", "a.mp4", "C.mp4", "d.mp4"):
+            write(self.tmp / name, name.encode())
+        assets, _ = run([self.tmp])
+        self.assertEqual([a["relative_path"] for a in assets], ["a.mp4", "B.mp4", "C.mp4", "d.mp4"])
+
+    def test_a_same_size_rewrite_is_detected_by_the_timestamp(self):
+        path = write(self.tmp / "a.mp4", b"x" * 1000)
+        real = hashlib.file_digest
+
+        def rewrite(stream, name):
+            digest = real(stream, name)
+            path.write_bytes(b"y" * 1000)
+            later = path.stat().st_mtime_ns + 10**9
+            os.utime(path, ns=(later, later))
+            return digest
+
+        with mock.patch.object(importer.hashlib, "file_digest", rewrite):
+            with self.assertRaisesRegex(ValueError, "changed"):
+                importer.fingerprint_file(path, "a.mp4")
+
+    def test_growth_is_detected_even_if_the_timestamp_is_restored(self):
+        path = write(self.tmp / "a.mp4", b"x" * 1000)
+        original = path.stat().st_mtime_ns
+        real = hashlib.file_digest
+
+        def grow(stream, name):
+            digest = real(stream, name)
+            with open(path, "ab") as other:
+                other.write(b"more")
+            os.utime(path, ns=(original, original))
+            return digest
+
+        with mock.patch.object(importer.hashlib, "file_digest", grow):
+            with self.assertRaisesRegex(ValueError, "changed"):
+                importer.fingerprint_file(path, "a.mp4")
 
 
 class LinkTests(TempDirCase):
@@ -214,6 +279,17 @@ class LinkTests(TempDirCase):
         assets, issues = run([data])
         self.assertEqual([a["relative_path"] for a in assets], ["real.mp4"])
         self.assertEqual(sorted(codes(issues)), ["symlink_skipped"] * 3)
+
+    def test_skipped_links_are_reported_in_name_order_whatever_the_listing_order(self):
+        write(self.tmp / "elsewhere/x.mp4", b"1")
+        data = self.tmp / "data"
+        data.mkdir()
+        for letter in "hgfedcba":  # created in reverse so creation order cannot be mistaken for name order
+            self.link(self.tmp / "elsewhere", data / f"{letter}_dir", directory=True)
+            self.link(self.tmp / "elsewhere/x.mp4", data / f"{letter}_file.mp4")
+        _, issues = run([data])
+        names = [Path(i["path"]).name for i in issues if i["code"] == "symlink_skipped"]
+        self.assertEqual(names, [f"{c}_dir" for c in "abcdefgh"] + [f"{c}_file.mp4" for c in "abcdefgh"])
 
     def test_reaching_data_through_a_linked_path_works(self):
         write(self.tmp / "real/a.mp4", b"1")

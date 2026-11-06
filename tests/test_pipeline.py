@@ -195,7 +195,9 @@ class ExitStatus(PipelineCase):
     def test_two_for_usage_errors(self):
         video = str(self.corpus.path("h264_mp4.mp4"))
         for argv in (["-o", str(self.out())], [video], [video, "-o", str(self.out()), "--timeout", "0"],
-                     [video, "-o", str(self.out()), "--timeout", "nan"], [video, "-o", str(self.out()), "--max-output-bytes", "-1"],
+                     [video, "-o", str(self.out()), "--timeout", "nan"],
+                     [video, "-o", str(self.out()), "--timeout", "inf"], [video, "-o", str(self.out()), "--timeout=-5"],
+                     [video, "-o", str(self.out()), "--max-output-bytes", "0"], [video, "-o", str(self.out()), "--max-output-bytes", "-1"],
                      [video, "-o", str(self.out()), "--bogus"]):
             with self.subTest(argv):
                 self.assertEqual(run_main(*argv)[0], 2)
@@ -223,6 +225,13 @@ class ExitStatus(PipelineCase):
         report = read_report(self.out())
         self.assertEqual(report["schema"]["status"], "unavailable")
         self.assertEqual(acquisition(report["records"][0])["video_codec"], "h264")
+
+    def test_documented_defaults(self):
+        args = main._parser().parse_args(["x", "-o", "y"])
+        self.assertEqual(
+            (args.timeout, args.max_output_bytes, args.ffprobe, args.extensions, args.schema, args.metadata),
+            (60, 16 * 1024 * 1024, "ffprobe", None, None, None),
+        )
 
     def test_version(self):
         status, stdout, _ = run_main("--version")
@@ -384,7 +393,8 @@ class Behaviour(PipelineCase):
 class Fuzzing(PipelineCase):
     """Corrupted media must never crash, hang or poison the output."""
 
-    MUTATIONS = 60
+    MUTATIONS = int(os.environ.get("PYVMM_FUZZ_COUNT", "60"))
+    SEED = int(os.environ.get("PYVMM_FUZZ_SEED", "20261104"))
 
     def mutate(self, rng, data):
         data = bytearray(data)
@@ -408,7 +418,7 @@ class Fuzzing(PipelineCase):
         return data
 
     def test_seeded_corruptions(self):
-        rng = random.Random(20261104)
+        rng = random.Random(self.SEED)
         bases = [(n, self.corpus.path(n).read_bytes()) for n in
                  ("h264_mp4.mp4", "mjpeg_avi.avi", "ffv1_gray_mkv.mkv", "vp9_webm.webm", "h264_mov.mov", "mpeg2_ts.ts",
                   "theora_ogv.ogv", "raw_stream.h264")]
@@ -457,6 +467,15 @@ class Documentation(unittest.TestCase):
         block = re.search(r"```json\n(.*?)\n```", text[marker:], re.S)
         self.assertIsNotNone(block, "README must show the example right after the marker")
         self.assertEqual(json.loads(block.group(1)), VALID_METADATA)
+
+    def test_every_issue_code_the_code_can_raise_is_documented(self):
+        pattern = re.compile(r'(?:_issue\((?:issues,\s*)?|ProbeError\()\s*"([a-z_]+)"')
+        codes = set()
+        for name in ("import.py", "extract.py", "align.py"):
+            codes |= set(pattern.findall((ROOT / name).read_text(encoding="utf-8")))
+        self.assertGreater(len(codes), 25)
+        text = self.readme()
+        self.assertEqual(sorted(code for code in codes if f"`{code}`" not in text), [])
 
     def test_the_readme_states_the_exit_statuses_the_program_uses(self):
         text = self.readme()

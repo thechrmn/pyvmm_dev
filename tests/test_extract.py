@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -120,6 +121,19 @@ class TechnicalTests(unittest.TestCase):
         technical, issues = derive(stream(width=0), container={"format_name": "h264"})
         self.assertEqual(codes(issues), ["elementary_stream_timing_unknown", "technical_value_unavailable"])
 
+    def test_the_base_rate_tolerance_is_one_percent_inclusive(self):
+        _, issues = derive(stream(avg_frame_rate="303/10", r_frame_rate="30/1"))  # exactly +1 %
+        self.assertEqual(codes(issues), ["possible_variable_frame_rate"])
+        _, issues = derive(stream(avg_frame_rate="3031/100", r_frame_rate="30/1"))
+        self.assertEqual(codes(issues), ["implausible_average_frame_rate"])
+
+    def test_duration_reports_may_differ_by_rounding_up_to_one_microsecond(self):
+        # FFprobe prints six decimals, so a difference of up to 1 us is rounding, not disagreement.
+        for ticks, want in ((20000004, []), (20000010, []), (20000011, ["duration_mismatch"]), (19999980, ["duration_mismatch"])):
+            with self.subTest(ticks):
+                _, issues = derive(stream(duration_ts=ticks, time_base="1/10000000", duration="2.000000"))
+                self.assertEqual(codes(issues), want)
+
     def test_no_rate_at_all_is_reported_not_invented(self):
         technical, issues = derive(stream(avg_frame_rate="0/0", r_frame_rate="0/0"))
         self.assertNotIn("frame_rate", technical)
@@ -134,6 +148,11 @@ class TechnicalTests(unittest.TestCase):
         technical, issues = derive(stream(duration_ts=None, time_base=None, duration="2.5"))
         self.assertEqual((technical["duration_seconds"], technical["duration_source"]), (2.5, "stream.duration"))
         self.assertEqual(issues, [])
+
+    def test_no_duration_anywhere_is_reported_once_and_not_invented(self):
+        technical, issues = derive(stream(duration_ts=None, time_base=None, duration=None))
+        self.assertNotIn("duration_seconds", technical)
+        self.assertEqual(codes(issues), ["technical_value_unavailable"])
 
     def test_single_stream_container_duration_is_a_flagged_fallback(self):
         technical, issues = derive(
@@ -150,6 +169,15 @@ class TechnicalTests(unittest.TestCase):
         self.assertNotIn("duration_seconds", technical)
         self.assertEqual(codes(issues), ["video_duration_ambiguous", "technical_value_unavailable"])
 
+    def test_attachments_and_cover_art_do_not_make_the_container_duration_ambiguous(self):
+        video = stream(duration_ts=None, time_base=None, duration=None)
+        for extra in ({"index": 1, "codec_type": "attachment"},
+                      {"index": 1, "codec_type": "video", "disposition": {"attached_pic": 1}}):
+            with self.subTest(extra["codec_type"]):
+                technical, issues = derive(video, extra, container={"duration": "3.25"})
+                self.assertEqual(technical["duration_seconds"], 3.25)
+                self.assertEqual(codes(issues), ["container_duration_fallback"])
+
     def test_cover_art_is_not_a_video_stream(self):
         cover = stream(disposition={"default": 0, "attached_pic": 1})
         technical, issues = derive(cover, {"index": 1, "codec_type": "audio"})
@@ -164,6 +192,22 @@ class TechnicalTests(unittest.TestCase):
         self.assertEqual(codes(issues), ["multiple_video_streams"])
         technical, _ = derive(third, first)
         self.assertEqual(technical["stream_index"], 0)
+
+    def test_exactly_two_video_streams_are_already_ambiguous_and_one_is_not(self):
+        _, issues = derive(stream(index=0), stream(index=1))
+        self.assertEqual(codes(issues), ["multiple_video_streams"])
+        _, issues = derive(stream(index=0), {"index": 1, "codec_type": "audio"})
+        self.assertEqual(issues, [])
+
+    def test_names_must_be_non_empty_text(self):
+        for value in ("", 5, None, ["h264"]):
+            with self.subTest(repr(value)):
+                technical, _ = derive(stream(codec_name=value, pix_fmt=value))
+                self.assertNotIn("codec", technical)
+                self.assertNotIn("pixel_format", technical)
+        missing = stream()
+        del missing["codec_name"]
+        self.assertNotIn("codec", derive(missing)[0])
 
     def test_zero_dimensions_are_unusable(self):
         technical, issues = derive(stream(width=0, height="x"))
@@ -270,6 +314,16 @@ class ExtractMetadataTests(TempDirCase):
         self.assertEqual(self.issue_codes(result), [("warning", "ffprobe_diagnostic")])
         self.assertEqual(len(result["issues"][0]["message"]), 1000)
 
+    def test_probe_failure_text_reaches_the_issue(self):
+        with mock.patch.object(extract, "_run", side_effect=extract.ProbeError("ffprobe_timeout", "took too long")):
+            result = extract.extract_metadata(self.asset)
+        self.assertEqual(result["issues"][0]["message"], "took too long")
+
+    def test_documented_defaults_are_forwarded(self):
+        self.assertEqual(extract.MAX_OUTPUT_BYTES, 16 * 1024 * 1024)
+        self.probe(json.dumps({"streams": [stream()]}).encode())
+        self.assertEqual(self.run_mock.call_args.args[1:], (60, 16 * 1024 * 1024))
+
     def test_probe_failures_become_issues_with_their_own_codes(self):
         for code in ("ffprobe_timeout", "ffprobe_output_limit", "ffprobe_unavailable"):
             with self.subTest(code):
@@ -319,6 +373,45 @@ class RunTests(unittest.TestCase):
         code = "import sys; sys.stdout.write('x' * 3_000_000)"
         status, out, _ = extract._run(self.python(code), 30, 16 * 1024 * 1024)
         self.assertEqual((status, len(out)), (0, 3_000_000))
+
+    def test_output_exactly_at_the_limit_is_kept_and_one_byte_more_is_refused(self):
+        code = "import sys; sys.stdout.write('x' * 1000)"
+        self.assertEqual(extract._run(self.python(code), 30, 1000)[1], b"x" * 1000)
+        with self.assertRaises(extract.ProbeError):
+            extract._run(self.python(code), 30, 999)
+
+    def test_output_is_complete_even_when_the_reader_lags_behind_the_process(self):
+        real_popen = subprocess.Popen
+
+        class SlowPipe:
+            def __init__(self, pipe):
+                self.pipe = pipe
+
+            def read(self, size):
+                data = self.pipe.read(size)
+                time.sleep(0.3)
+                return data
+
+            def close(self):
+                self.pipe.close()
+
+        def lagging(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            process.stdout = SlowPipe(process.stdout)
+            return process
+
+        with mock.patch.object(extract.subprocess, "Popen", lagging):
+            _, out, _ = extract._run(self.python("import sys; sys.stdout.write('hello')"), 30, 1000)
+        self.assertEqual(out, b"hello")
+
+    @unittest.skipIf(os.name == "nt", "needs a POSIX shell")
+    def test_an_orphaned_child_holding_the_pipes_cannot_stall_the_run(self):
+        with tempfile.TemporaryDirectory() as folder:
+            script = fake_ffprobe(folder, "sleep 8 &\nexit 0")  # the orphan outlives the script
+            started = time.monotonic()
+            status, _, _ = extract._run([script], 30, 1000)
+            self.assertEqual(status, 0)
+            self.assertLess(time.monotonic() - started, 6)
 
     def test_missing_executable(self):
         with self.assertRaises(extract.ProbeError) as caught:
@@ -429,6 +522,15 @@ class InspectTests(TempDirCase):
         with self.assertRaisesRegex(ValueError, "Not a working FFprobe"):
             extract.inspect_ffprobe(sys.executable)
 
+    def test_the_error_text_of_a_rejected_executable_is_bounded(self):
+        probe = fake_ffprobe(self.tmp, "head -c 1000 /dev/zero | tr '\\0' z >&2; exit 3")
+        if probe is None:
+            self.skipTest("needs a POSIX shell")
+        with self.assertRaisesRegex(ValueError, "Not a working FFprobe") as caught:
+            extract.inspect_ffprobe(probe)
+        longest_run = max(len(run) for run in re.findall("z+", str(caught.exception)))
+        self.assertEqual(longest_run, 300)  # the path in the message may contain a stray z
+
     def test_failing_executable_is_rejected(self):
         probe = fake_ffprobe(self.tmp, "echo 'ffprobe version 9' ; exit 1")
         if probe is None:
@@ -442,6 +544,14 @@ class InspectTests(TempDirCase):
             self.skipTest("needs a POSIX shell")
         with self.assertRaisesRegex(ValueError, "Cannot inspect FFprobe"):
             extract.inspect_ffprobe(probe, timeout=1)
+
+    def test_batch_file_names_are_only_refused_on_windows(self):
+        probe = fake_ffprobe(self.tmp, 'echo "ffprobe version 9.9"')
+        if probe is None:
+            self.skipTest("needs a POSIX shell")
+        renamed = Path(probe).with_name("ffprobe.bat")
+        Path(probe).rename(renamed)
+        self.assertEqual(extract.inspect_ffprobe(str(renamed))["version"], "9.9")
 
     def test_batch_scripts_are_refused_on_windows(self):
         script = self.tmp / "ffprobe.bat"

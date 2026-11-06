@@ -112,7 +112,7 @@ def import_files(inputs, issues, *, extensions=VIDEO_EXTENSIONS):
         base = Path(os.path.commonpath(anchors)) if anchors else None
     except ValueError:  # inputs on different drives
         base = None
-    seen, count = {}, 0
+    seen, imported = {}, False
     for path in sorted(found, key=lambda p: (str(p).casefold(), str(p))):
         relative = path.relative_to(base).as_posix() if base else path.as_posix()
         try:
@@ -123,7 +123,7 @@ def import_files(inputs, issues, *, extensions=VIDEO_EXTENSIONS):
         first = seen.setdefault(asset["sha256"], relative)
         if first != relative:
             _issue(issues, "duplicate_content", f"Identical bytes to {first}.", path)
-        count += 1
+        imported = True
         yield asset
-    if not count:
+    if not imported:
         _issue(issues, "no_inputs", "No readable video files were found.", severity="error")

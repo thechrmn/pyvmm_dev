@@ -3,6 +3,7 @@ import copy
 import hashlib
 import http.server
 import json
+import random
 import re
 import sys
 import threading
@@ -62,11 +63,11 @@ def issue_codes(record):
 class FormatChecks(unittest.TestCase):
     def check(self, function, valid, invalid):
         for value in valid:
-            self.assertTrue(function(value), f"should accept {value!r}")
+            self.assertIs(function(value), True, f"should accept {value!r}")
         for value in invalid:
-            self.assertFalse(function(value), f"should reject {value!r}")
+            self.assertIs(function(value), False, f"should reject {value!r}")
         for value in (5, None, True, [], {}):
-            self.assertTrue(function(value), "formats apply to strings only")
+            self.assertIs(function(value), True, "formats apply to strings only")
 
     def test_date(self):
         self.check(
@@ -82,7 +83,7 @@ class FormatChecks(unittest.TestCase):
             ["2025-03-01T10:20:30Z", "2025-03-01t10:20:30z", "2025-03-01T10:20:30.123+02:00",
              "2025-12-31T23:59:60Z", "2025-03-01T10:20:30-23:59"],
             ["2025-03-01T10:20:30", "2025-03-01 10:20:30Z", "2025-13-01T10:20:30Z", "2025-02-30T10:20:30Z",
-             "2025-03-01T24:00:00Z", "2025-03-01T10:60:00Z", "2025-03-01T10:20:61Z", "2025-03-01T10:20:30+24:00",
+             "2025-03-01T24:00:00Z", "2025-03-01T10:60:00Z", "2025-03-01T10:20:61Z", "2025-03-01T10:20:30+24:00", "2025-03-01T10:20:30+02:60", "2025-03-01T10:20:30-02:60",
              "2025-03-01T10:20:30+02", "2025-03-01T10:20:30.Z", "0000-01-01T00:00:00Z", "yesterday", "2025-03-01T10:20:30Z\n"],
         )
 
@@ -154,10 +155,12 @@ class MetadataFile(TempDirCase):
                 with self.assertRaises(ValueError):
                     self.load(content)
 
-    def test_oversized_file_is_refused(self):
+    def test_oversized_file_is_refused_and_one_exactly_at_the_limit_is_read(self):
+        self.assertEqual(align.MAX_JSON_BYTES, 16 * 1024 * 1024)
         with mock.patch.object(align, "MAX_JSON_BYTES", 10):
+            self.assertEqual(self.load('{"a": 123}')["bestmeta"], {"a": 123})  # exactly 10 bytes
             with self.assertRaisesRegex(ValueError, "exceeds"):
-                self.load('{"a": "0123456789"}')
+                self.load('{"a": 1234}')  # 11 bytes
 
     def test_missing_file_and_folders(self):
         with self.assertRaises(OSError):
@@ -307,6 +310,11 @@ class Mapping(SchemaCase):
                             "3gp4": "other", "mjp2": "other", "": "other"}.items():
             with self.subTest(brand):
                 self.assertEqual(acq(align_one(ex=extraction(brand=brand)), "video_container_format"), want)
+
+    def test_the_brand_rule_applies_to_the_short_family_name_too(self):
+        for brand, want in {"qt": "mov", "isom": "mp4", "3gp4": "other"}.items():
+            with self.subTest(brand):
+                self.assertEqual(acq(align_one(ex=extraction(brand=brand, container="mov,mp4")), "video_container_format"), want)
 
     def test_other_containers(self):
         for name, want in {"avi": "avi", "matroska,webm": "other", "mpegts": "other", "ogg": "other", "dv": "other"}.items():
@@ -562,6 +570,73 @@ class Validation(SchemaCase):
         self.assertEqual(good["bestmeta"]["image"], {"width_px": 320})
         bad = align_one(schema=context, field_map={"height": ("other", "h")})
         self.assertEqual(bad["validation"]["missing_required"], ["image"])
+
+
+class RandomMetadata(SchemaCase):
+    """Invariants of the merge for arbitrary researcher input (seeded, so failures reproduce)."""
+
+    KEYS = ("hardware_and_acquisition", "acquisition", "hardware", "video_resolution_width", "frame_rate",
+            "recording_duration", "dataset_id", "dataset_title", "bit_depth", "video_codec", "x", "a.b", "~", "")
+
+    def scalar(self, rng):
+        return rng.choice((0, 1, -7, 30, 30.0, 0.5, True, False, None, "", "text", "PT2S", "other", "h264", "ünï"))
+
+    def mapping(self, rng, depth=0):
+        result = {}
+        for _ in range(rng.randint(0, 4)):
+            kind = rng.random()
+            if depth < 3 and kind < 0.4:
+                result[rng.choice(self.KEYS)] = self.mapping(rng, depth + 1)
+            elif kind < 0.5:
+                result[rng.choice(self.KEYS)] = [self.scalar(rng) for _ in range(rng.randint(0, 3))]
+            else:
+                result[rng.choice(self.KEYS)] = self.scalar(rng)
+        return result
+
+    def leaves(self, node, prefix=()):
+        for key, value in node.items():
+            if isinstance(value, dict):
+                yield from self.leaves(value, (*prefix, key))
+            else:
+                yield (*prefix, key), value
+
+    def assert_researcher_values_landed(self, supplied, final, conflicts, prefix=()):
+        for key, value in supplied.items():
+            path = align._path((*prefix, key))
+            if path in conflicts:
+                continue
+            if isinstance(value, dict) and isinstance(final.get(key), dict):
+                self.assert_researcher_values_landed(value, final[key], conflicts, (*prefix, key))
+            else:
+                self.assertTrue(align._same_json(final[key], value), path)
+
+    def test_arbitrary_researcher_metadata_keeps_every_invariant(self):
+        rng = random.Random(20261104)
+        for case in range(400):
+            metadata = {"bestmeta": self.mapping(rng), "annotations": self.mapping(rng)}
+            ex = extraction()
+            before = copy.deepcopy((ex, metadata))
+            with self.subTest(case=case):
+                record = align.align_metadata(ex, metadata, SCHEMA)
+                self.assertEqual((ex, metadata), before, "inputs must never be modified")
+                text = json.dumps(record, allow_nan=False, sort_keys=True)  # strictly serialisable
+                self.assertEqual(text, json.dumps(align.align_metadata(ex, metadata, SCHEMA), sort_keys=True))
+                conflicts = {c["path"] for c in record["conflicts"]}
+                replaceable = {"dataset_id", "hardware_and_acquisition.acquisition.frame_rate",
+                               "hardware_and_acquisition.acquisition.recording_duration"}
+                self.assertFalse(conflicts & replaceable)
+                self.assert_researcher_values_landed(metadata["bestmeta"], record["bestmeta"], conflicts)
+                for conflict in record["conflicts"]:
+                    self.assertIn(conflict["path"], record["provenance"])
+                    self.assertNotEqual(conflict["extracted"], conflict["annotation"])
+                for parts, _ in self.leaves(record["bestmeta"]):
+                    # a researcher object that replaces a whole value is one provenance entry, at the replaced path
+                    covered = any(align._path(parts[:n]) in record["provenance"] for n in range(1, len(parts) + 1))
+                    self.assertTrue(covered, f"{align._path(parts)} must say where it came from")
+                validation = record["validation"]
+                if validation["valid"]:
+                    self.assertTrue(validation["schema_valid"] and not conflicts)
+                self.assertEqual(validation["schema_valid"], not validation["errors"])
 
 
 class ErrorFlattening(unittest.TestCase):

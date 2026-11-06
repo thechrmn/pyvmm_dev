@@ -41,6 +41,38 @@ class ProbeError(Exception):
         self.code = code
 
 
+class _Reader(threading.Thread):
+    """Collects one output pipe; kills the process if the pipe delivers more than ``limit`` bytes."""
+
+    def __init__(self, pipe, limit, process):
+        super().__init__(daemon=True)
+        self.pipe, self.limit, self.process = pipe, limit, process
+        self.data, self.overflowed = b"", False
+
+    def run(self):
+        chunks, size = [], 0
+        for chunk in iter(lambda: self.pipe.read(65536), b""):
+            size += len(chunk)
+            if size > self.limit:
+                self.overflowed = True
+                self.process.kill()
+                break
+            chunks.append(chunk)
+        self.data = b"".join(chunks)
+
+
+def _reap(process, readers):
+    """Kill and collect the process; stop waiting for its output after two seconds."""
+    if process.poll() is None:
+        process.kill()
+    process.wait()
+    for reader in readers:
+        reader.join(timeout=2)  # a wrapper script's orphaned child may still hold the pipes
+    if not any(reader.is_alive() for reader in readers):
+        process.stdout.close()  # closing under a blocked reader would block here as well
+        process.stderr.close()
+
+
 def _run(command, timeout, limit):
     """Run ``command``; return (exit code, stdout, stderr) or raise ProbeError.
 
@@ -53,23 +85,7 @@ def _run(command, timeout, limit):
         )
     except OSError as error:
         raise ProbeError("ffprobe_unavailable", f"Cannot start FFprobe: {error}") from error
-    captured, overflow = {}, threading.Event()
-
-    def drain(name, pipe):
-        chunks, size = [], 0
-        for chunk in iter(lambda: pipe.read(65536), b""):
-            size += len(chunk)
-            if size > limit:
-                overflow.set()
-                process.kill()
-                break
-            chunks.append(chunk)
-        captured[name] = b"".join(chunks)
-
-    readers = [
-        threading.Thread(target=drain, args=pair, daemon=True)
-        for pair in (("stdout", process.stdout), ("stderr", process.stderr))
-    ]
+    readers = [_Reader(pipe, limit, process) for pipe in (process.stdout, process.stderr)]
     for reader in readers:
         reader.start()
     timed_out = False
@@ -78,18 +94,12 @@ def _run(command, timeout, limit):
     except subprocess.TimeoutExpired:
         timed_out = True
     finally:
-        if process.poll() is None:
-            process.kill()
-        process.wait()
-        for reader in readers:
-            reader.join(timeout=2)  # a wrapper script's orphaned child may hold the pipes
-        process.stdout.close()
-        process.stderr.close()
+        _reap(process, readers)
     if timed_out:
         raise ProbeError("ffprobe_timeout", f"FFprobe did not finish within {timeout} s.")
-    if overflow.is_set():
+    if any(reader.overflowed for reader in readers):
         raise ProbeError("ffprobe_output_limit", f"FFprobe printed more than {limit} bytes.")
-    return process.returncode, captured.get("stdout", b""), captured.get("stderr", b"")
+    return process.returncode, readers[0].data, readers[1].data
 
 
 def inspect_ffprobe(ffprobe="ffprobe", *, timeout=10):
@@ -141,7 +151,7 @@ def _issue(issues, code, message, severity="warning"):
 
 def _number(value, *, signed=False):
     """Exact Fraction from FFprobe text such as '30000/1001' or '2.002', else None."""
-    text = str(value).strip() if value is not None and not isinstance(value, bool) else ""
+    text = str(value).strip()  # None, True and the like become words the pattern rejects
     if not _NUMBER.fullmatch(text):
         return None
     try:

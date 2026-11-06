@@ -2,6 +2,7 @@ import csv
 import io
 import json
 import os
+import shutil
 import unittest
 from unittest import mock
 
@@ -68,6 +69,10 @@ class Publication(ExportCase):
         summary = self.export([record(missing=["b", "a"]), record(missing=["b"]), record(missing=["c"])])
         self.assertEqual(list(summary["missing_required"].items()), [("b", 2), ("a", 1), ("c", 1)])
 
+    def test_equally_frequent_fields_are_listed_alphabetically_not_by_arrival(self):
+        summary = self.export([record(missing=["z"]), record(missing=["a"])])
+        self.assertEqual(list(summary["missing_required"]), ["a", "z"])
+
     def test_success_needs_all_valid_and_no_errors_anywhere(self):
         self.assertTrue(self.export([record(), record("b.mp4")], name="ok")["success"])
         self.assertFalse(self.export([record(issues=[issue("error")])], name="e1")["success"])
@@ -110,6 +115,60 @@ class Publication(ExportCase):
         summary = self.export(record(f"f{i}.mp4", technical={"width": i}) for i in range(3000))
         self.assertEqual(summary["files"], 3000)
         self.assertEqual(len(self.load_csv()), 3000)
+
+
+class Layout(ExportCase):
+    def test_exact_document_layout(self):
+        def canonical(value):  # nested keys are written sorted
+            if isinstance(value, dict):
+                return {key: canonical(value[key]) for key in sorted(value)}
+            return [canonical(item) for item in value] if isinstance(value, list) else value
+
+        rec = record("a.mp4", bestmeta={"k": 1})
+        found = [issue("warning", "duplicate_content")]
+        summary = self.export([rec], import_issues=found)
+        document = {"run": {"tool": "t"}, "schema": {"status": "available"}, "records": [rec],
+                    "import_issues": found, "summary": summary}
+        expected = json.dumps({key: canonical(value) for key, value in document.items()}, indent=2) + "\n"
+        self.assertEqual((self.out() / "metadata.json").read_text(), expected)
+
+    def test_exact_layout_without_records(self):
+        self.export([])
+        text = (self.out() / "metadata.json").read_text()
+        self.assertIn('  "records": [],\n  "import_issues": [],\n  "summary": {\n', text)
+
+
+class Durability(ExportCase):
+    def test_sync_flushes_python_buffers_before_asking_the_os(self):
+        calls = []
+        stream = mock.Mock()
+        stream.fileno.return_value = 7
+        stream.flush.side_effect = lambda: calls.append("flush")
+        with mock.patch.object(export.os, "fsync", lambda fd: calls.append(("fsync", fd))):
+            export._sync(stream)
+        self.assertEqual(calls, ["flush", ("fsync", 7)])
+
+    def test_both_files_are_synced_before_they_are_published(self):
+        synced, real = [], export._sync
+        with mock.patch.object(export, "_sync", lambda stream: (synced.append(os.path.basename(stream.name)), real(stream))[1]):
+            self.export([record()])
+        self.assertEqual(synced, [".metadata.json.tmp", ".metadata.csv.tmp"])
+
+    def test_a_failing_cleanup_does_not_replace_the_original_error(self):
+        real = shutil.rmtree
+
+        def strict(path, ignore_errors=False, **kwargs):
+            if not ignore_errors:
+                raise PermissionError("cannot clean")
+            return real(path, ignore_errors=True)
+
+        def stream():
+            yield record()
+            raise RuntimeError("boom")
+
+        with mock.patch.object(export.shutil, "rmtree", strict):
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                self.export(stream())
 
 
 class NoOverwrite(ExportCase):

@@ -161,6 +161,13 @@ whitelist. The whitelist matters for correctness as well as security: a text fil
 video. Remote `$ref`s in schemas are never fetched. Links found inside searched folders are not
 followed. File names are never interpreted by a shell.
 
+## Performance
+
+Measured on one CPU core. Hashing runs at disk speed (about 1 GB/s from cache): a 1.2 GB file took 1.2 s
+end to end. Each file adds about 40 ms for FFprobe and alignment: 2,000 small files took 79 s. Memory
+stays near 50 MB whatever the size or number of files. Output is about 9 KB of JSON and 2 KB of CSV per
+file. Estimate a large archive as (total size / 1 GB/s) + (files x 40 ms).
+
 ## Limits
 
 * Video containers FFmpeg can read. HDF5 and image sequences (also listed by BeStMeta) are not
@@ -168,8 +175,13 @@ followed. File names are never interpreted by a shell.
 * Metadata is read, not verified: files are not decoded.
 * `import.py` is named as requested; `main.py` loads it with `importlib` because `import` is a
   Python keyword. No other module imports it.
-* Developed and tested on Linux with FFmpeg 6.1 and Python 3.12. `.github/workflows/test.yml` runs the
-  suite on Linux, macOS and Windows; macOS and Windows have not been exercised by the author.
+* Verified on Linux with FFmpeg 6.1.1 on Python 3.11, 3.12, 3.13 and 3.14, with `jsonschema` 4.18 to
+  4.26, and with `jsonschema` absent. `.github/workflows/test.yml` runs the suite on Linux, macOS and
+  Windows on every push and weekly; macOS and Windows have **not** been run by the author, so treat them
+  as untested until that workflow is green.
+* `--ffprobe` must be the real executable or a wrapper that `exec`s it. After a timeout the run moves on
+  at once, but a wrapper's orphaned child cannot be killed and keeps running.
+* Files are processed one after another (see Performance).
 
 ## Adapting
 
@@ -181,9 +193,12 @@ followed. File names are never interpreted by a shell.
 ## Development
 
 ```
-python -m unittest                       # needs ffmpeg and ffprobe to build test videos
+python -m unittest                       # about 245 tests, 40 s; needs ffmpeg and ffprobe to build test videos
+PYVMM_FUZZ_SEED=7 PYVMM_FUZZ_COUNT=400 python -m unittest tests.test_pipeline.Fuzzing   # bigger corruption fuzz
+python tools/mutate.py . 1               # mutation testing: do the tests notice deliberately broken code?
 ```
 
-The suite generates its videos with ffmpeg, so no binary files are stored. See
+The suite generates its videos with ffmpeg, so no binary files are stored. `docs/ASSESSMENT.md` records how
+the pipeline was assessed and what is not covered. See
 `schemas/README.md` for the bundled schema and how to update it, and
 `docs/LIBRARY_EVALUATION.md` for why FFprobe and `jsonschema` were chosen.
