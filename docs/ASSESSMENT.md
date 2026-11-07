@@ -21,6 +21,8 @@ last source change found nothing new.
 | 4 | Mutation testing, 590 AST mutants | 44 survivors among the 506 judged in the first pass. Real gaps: issue order, Windows junctions, fsync, output layout, defaults, boundaries. **A real bug:** closing a pipe while a reader thread was blocked defeated the deadline whenever a wrapper's child held the pipes. One flaky test (random temp-dir names) | tests added, `_Reader`/`_reap` extracted; final 579 of 590 killed (98.1%) |
 | 5 | Python 3.11-3.14, `jsonschema` 4.18-4.26 and absent, performance, 400-file fuzz with a new seed, 400-case random-metadata property test | Nothing in the product. One test invariant was too strict (provenance of an object that replaces a whole value) | test refined |
 
+| 6 | First GitHub Actions run (screenshot only; the failing log was not available to me) | All 16 jobs failed, ubuntu included. **Not reproduced**: the suite passes on Linux with FFmpeg 6.1.1, 9.0.2 (conda) and a static master build, as root and as an unprivileged user. Found while trying: tests crashed instead of skipping when an FFmpeg build lacks an encoder; one test did not test what its name claimed (it passed valid UTF-8, never a Latin-1 byte); filenames and text reads that break on Windows | skipped-fixture handling, a loud CI-only guard for the one essential encoder, tool-versions step in the workflow, the Latin-1 test now passes a real 0xE9 byte. **The cause of the red run is unknown until its log is read** |
+
 The 11 surviving mutants are arbitrary constants (default timeouts, a cache size, buffer sizes), equivalent
 mutations (a regex-group default, `read(MAX+1)` versus `+2`) or unobservable behaviour (`daemon=True`, a
 `break` after the process is already killed).
@@ -44,8 +46,9 @@ mutations (a regex-group default, `read(MAX+1)` versus `+2`) or unobservable beh
 
 ## Not verified
 
-* **Windows and macOS.** Code paths exist (junctions, batch-file refusal) and are unit-tested by simulation,
-  but nothing ran there. `.github/workflows/test.yml` will.
+* **GitHub Actions.** The first run failed on all 16 jobs and I could not reproduce it (Round 6), so no
+  platform is confirmed there yet. Windows and macOS code paths (junctions, batch-file refusal) are
+  unit-tested by simulation only; nothing of mine ran on them.
 * **Real recordings.** The published datasets in `published_video_files.ods` and vendor-camera files were
   unreachable. Synthetic media cannot reproduce every vendor quirk; DV and raw streams show that such
   quirks exist.

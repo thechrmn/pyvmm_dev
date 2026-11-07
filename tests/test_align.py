@@ -99,7 +99,7 @@ class FormatChecks(unittest.TestCase):
 
 class DurationFormat(unittest.TestCase):
     PATTERN = re.compile(
-        json.loads(Path(align.DEFAULT_SCHEMA).read_text())["$defs"]["Acquisition"]["properties"]["recording_duration"]["pattern"]
+        json.loads(Path(align.DEFAULT_SCHEMA).read_text(encoding="utf-8"))["$defs"]["Acquisition"]["properties"]["recording_duration"]["pattern"]
     )
 
     def test_values(self):
@@ -183,7 +183,7 @@ class SchemaLoading(TempDirCase):
         self.assertEqual(info["dialect"], "https://json-schema.org/draft/2019-09/schema")
         self.assertEqual(SCHEMA["issues"], [])
         self.assertEqual(Path(info["path"]), align.DEFAULT_SCHEMA)
-        self.assertIn(PINNED_BESTMETA_SHA256, (Path(align.DEFAULT_SCHEMA).parent / "README.md").read_text())
+        self.assertIn(PINNED_BESTMETA_SHA256, (Path(align.DEFAULT_SCHEMA).parent / "README.md").read_text(encoding="utf-8"))
 
     def test_explicit_path_to_the_same_file_gives_the_same_result(self):
         again = align.load_schema(align.DEFAULT_SCHEMA)

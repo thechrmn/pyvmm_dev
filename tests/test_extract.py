@@ -650,15 +650,20 @@ class OracleTests(TempDirCase):
                 result = extract.extract_metadata(asset, ffprobe=self.ffprobe, **options)
                 self.assertEqual([i["code"] for i in result["issues"]], [code])
 
-    def test_latin1_tag_bytes_do_not_break_extraction(self):
+    @unittest.skipIf(os.name == "nt", "a raw non-UTF-8 byte cannot be passed on a Windows command line")
+    def test_tag_text_that_is_not_utf8_does_not_break_extraction(self):
         support.require(self.corpus, "mjpeg_avi.avi")
         legacy = self.derived("latin1_tag.avi")
+        raw_byte_argument = os.fsdecode(b"title=caf\xe9 assay")  # what legacy Windows software writes: 0xE9, not UTF-8
+        self.assertEqual(os.fsencode(raw_byte_argument), b"title=caf\xe9 assay")
         subprocess.run(
             [support.FFMPEG, "-v", "error", "-y", "-i", str(self.corpus.path("mjpeg_avi.avi")), "-c", "copy",
-             "-metadata", "software=caf\xe9", str(legacy)], check=True)
+             "-metadata", raw_byte_argument, str(legacy)], check=True)
+        self.assertIn(b"caf\xe9 assay", legacy.read_bytes())  # the invalid byte really is in the file
         result = extract.extract_metadata(importer.fingerprint_file(legacy, "latin1_tag.avi"), ffprobe=self.ffprobe)
         self.assertEqual([i for i in result["issues"] if i["severity"] == "error"], [])
         self.assertEqual(result["technical"]["width"], 320)
+        self.assertEqual(result["raw"]["format"]["tags"]["title"], "caf\ufffd assay")  # FFprobe substitutes U+FFFD
 
 
 if __name__ == "__main__":

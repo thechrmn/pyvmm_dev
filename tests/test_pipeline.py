@@ -299,6 +299,8 @@ class Safety(PipelineCase):
         folder.mkdir()
         names = ["a;touch PWNED;.mp4", "$(touch PWNED2).mp4", "`touch PWNED3`.mp4", "x' || touch PWNED4 || '.mp4",
                  "-i.mp4", "--help.mp4", "file:x.mp4", "concat:a|b.mp4", "pipe:0.mp4", "http:x.mp4"]
+        if os.name == "nt":  # Windows forbids some of these characters in file names
+            names = [name for name in names if not set(name) & set('<>:"/\\|?*')]
         for name in names:
             shutil.copy(self.corpus.path("h264_mp4.mp4"), folder / name)
         marker_dir = self.tmp / "cwd"
@@ -419,9 +421,10 @@ class Fuzzing(PipelineCase):
 
     def test_seeded_corruptions(self):
         rng = random.Random(self.SEED)
-        bases = [(n, self.corpus.path(n).read_bytes()) for n in
-                 ("h264_mp4.mp4", "mjpeg_avi.avi", "ffv1_gray_mkv.mkv", "vp9_webm.webm", "h264_mov.mov", "mpeg2_ts.ts",
-                  "theora_ogv.ogv", "raw_stream.h264")]
+        wanted = ("h264_mp4.mp4", "mjpeg_avi.avi", "ffv1_gray_mkv.mkv", "vp9_webm.webm", "h264_mov.mov", "mpeg2_ts.ts",
+                  "theora_ogv.ogv", "raw_stream.h264")
+        bases = [(n, self.corpus.path(n).read_bytes()) for n in wanted if n not in self.corpus.skipped]
+        self.assertGreaterEqual(len(bases), 3)
         folder = self.tmp / "fuzz"
         folder.mkdir()
         for i in range(self.MUTATIONS):
@@ -434,7 +437,7 @@ class Fuzzing(PipelineCase):
         def strict(token):
             raise ValueError(token)
 
-        report = json.loads((self.out() / "metadata.json").read_text(), parse_constant=strict)
+        report = json.loads((self.out() / "metadata.json").read_text(encoding="utf-8"), parse_constant=strict)
         self.assertEqual(report["summary"]["files"], self.MUTATIONS)
         for record in report["records"]:
             technical = record["extraction"]["technical"]

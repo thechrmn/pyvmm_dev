@@ -175,13 +175,15 @@ file. Estimate a large archive as (total size / 1 GB/s) + (files x 40 ms).
 * Metadata is read, not verified: files are not decoded.
 * `import.py` is named as requested; `main.py` loads it with `importlib` because `import` is a
   Python keyword. No other module imports it.
-* Verified on Linux with FFmpeg 6.1.1 on Python 3.11, 3.12, 3.13 and 3.14, with `jsonschema` 4.18 to
-  4.26, and with `jsonschema` absent. `.github/workflows/test.yml` runs the suite on Linux, macOS and
-  Windows on every push and weekly; macOS and Windows have **not** been run by the author, so treat them
-  as untested until that workflow is green.
+* Verified by the author on Linux: Python 3.11 to 3.14 with FFmpeg 6.1.1, plus FFmpeg 9.0.2 and a static
+  master build on 3.12; `jsonschema` 4.18 to 4.26, and `jsonschema` absent. `.github/workflows/test.yml` runs
+  the suite on Linux, macOS and Windows on every push and weekly. Treat a platform as untested until that
+  workflow is green for it; macOS and Windows have never been run by the author.
 * `--ffprobe` must be the real executable or a wrapper that `exec`s it. After a timeout the run moves on
   at once, but a wrapper's orphaned child cannot be killed and keeps running.
 * Files are processed one after another (see Performance).
+* Tag text that is not valid UTF-8 (common in old AVI files) reaches PyVMM with U+FFFD replacement
+  characters, because FFprobe substitutes them; the rest of the record is unaffected.
 
 ## Adapting
 
@@ -198,7 +200,9 @@ PYVMM_FUZZ_SEED=7 PYVMM_FUZZ_COUNT=400 python -m unittest tests.test_pipeline.Fu
 python tools/mutate.py . 1               # mutation testing: do the tests notice deliberately broken code?
 ```
 
-The suite generates its videos with ffmpeg, so no binary files are stored. `docs/ASSESSMENT.md` records how
+The suite generates its videos with ffmpeg, so no binary files are stored. Fixtures an FFmpeg build cannot
+encode (for example `libtheora`) are skipped and listed in the log; if it cannot encode H.264 the suite
+skips, or fails when the `CI` environment variable is set. `docs/ASSESSMENT.md` records how
 the pipeline was assessed and what is not covered. See
 `schemas/README.md` for the bundled schema and how to update it, and
 `docs/LIBRARY_EVALUATION.md` for why FFprobe and `jsonschema` were chosen.

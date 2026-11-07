@@ -12,6 +12,7 @@ import io
 import json
 import os
 import shutil
+import sys
 import subprocess
 import tempfile
 import unittest
@@ -187,47 +188,66 @@ class Corpus:
         self.skipped = skipped
 
     def path(self, name):
+        if name in self.skipped:
+            raise unittest.SkipTest(f"fixture {name} could not be encoded here: {self.skipped[name][:150]}")
         return self.root / name
 
 
 _cache = {}
 
 
+def _build():
+    root = Path(tempfile.mkdtemp(prefix="pyvmm-corpus-"))
+    atexit.register(shutil.rmtree, root, ignore_errors=True)
+    skipped = {}
+
+    def encode(args, output):
+        command = [FFMPEG, "-hide_banner", "-loglevel", "error", "-y", *args, str(output)]
+        result = subprocess.run(command, capture_output=True, text=True)
+        return result.returncode == 0, result.stderr.strip()[-300:]
+
+    for name, (args, _expected, _codec, _container) in VIDEOS.items():
+        ok, error = encode(args, root / name)
+        if not ok:
+            skipped[name] = error
+    if skipped:
+        print(f"note: {len(skipped)} media fixtures could not be built with this FFmpeg and are skipped: "
+              + ", ".join(sorted(skipped)), file=sys.stderr)
+    if "h264_mp4.mp4" in skipped:
+        message = f"this FFmpeg cannot encode H.264, which the media fixtures need: {skipped['h264_mp4.mp4']}"
+        raise AssertionError(message) if os.environ.get("CI") else unittest.SkipTest(message)
+    base = root / "h264_mp4.mp4"
+    data = base.read_bytes()
+    (root / "truncated.mp4").write_bytes(data[: len(data) // 3])
+    (root / "zero_bytes.mp4").write_bytes(b"")
+    (root / "garbage.mp4").write_bytes(bytes(range(256)) * 16)
+    (root / "text_named.mp4").write_text("this is not a video\n")
+    (root / "concat_redirect.mp4").write_text("ffconcat version 1.0\nfile 'h264_mp4.mp4'\n")
+    (root / "hls_redirect.mp4").write_text("#EXTM3U\n#EXTINF:2,\nh264_mp4.mp4\n#EXT-X-ENDLIST\n")
+    (root / "evil_ref.mp4").write_text("ffconcat version 1.0\nfile '/etc/hostname'\n")
+    (root / "evil.ffconcat").write_text("ffconcat version 1.0\nfile '/etc/passwd'\n")
+    (root / "evil.m3u8").write_text("#EXTM3U\n#EXTINF:1,\nfile:///etc/passwd\n#EXT-X-ENDLIST\n")
+    shutil.copy(base, root / "duplicate_of_h264.mp4")
+    shutil.copy(base, root / "video_with_txt_extension.txt")
+    (root / "sub").mkdir()
+    if "mjpeg_avi.avi" not in skipped:
+        shutil.copy(root / "mjpeg_avi.avi", root / "sub" / "nested.avi")
+    return Corpus(root, skipped)
+
+
 def corpus():
-    """Build the corpus once per test process; skip the calling test if tools are missing."""
+    """Build the corpus once per test process; skip (or, on CI, fail) the caller if tools are missing."""
     if FFMPEG is None or FFPROBE is None:
         raise unittest.SkipTest("ffmpeg and ffprobe are required to build media fixtures")
     if "corpus" not in _cache:
-        root = Path(tempfile.mkdtemp(prefix="pyvmm-corpus-"))
-        atexit.register(shutil.rmtree, root, ignore_errors=True)
-        skipped = {}
-
-        def encode(args, output):
-            command = [FFMPEG, "-hide_banner", "-loglevel", "error", "-y", *args, str(output)]
-            result = subprocess.run(command, capture_output=True, text=True)
-            return result.returncode == 0, result.stderr.strip()[:200]
-
-        for name, (args, _expected, _codec, _container) in VIDEOS.items():
-            ok, error = encode(args, root / name)
-            if not ok:
-                skipped[name] = error
-        base = root / "h264_mp4.mp4"
-        data = base.read_bytes()
-        (root / "truncated.mp4").write_bytes(data[: len(data) // 3])
-        (root / "zero_bytes.mp4").write_bytes(b"")
-        (root / "garbage.mp4").write_bytes(bytes(range(256)) * 16)
-        (root / "text_named.mp4").write_text("this is not a video\n")
-        (root / "concat_redirect.mp4").write_text("ffconcat version 1.0\nfile 'h264_mp4.mp4'\n")
-        (root / "hls_redirect.mp4").write_text("#EXTM3U\n#EXTINF:2,\nh264_mp4.mp4\n#EXT-X-ENDLIST\n")
-        (root / "evil_ref.mp4").write_text("ffconcat version 1.0\nfile '/etc/hostname'\n")
-        (root / "evil.ffconcat").write_text("ffconcat version 1.0\nfile '/etc/passwd'\n")
-        (root / "evil.m3u8").write_text("#EXTM3U\n#EXTINF:1,\nfile:///etc/passwd\n#EXT-X-ENDLIST\n")
-        shutil.copy(base, root / "duplicate_of_h264.mp4")
-        shutil.copy(base, root / "video_with_txt_extension.txt")
-        (root / "sub").mkdir()
-        shutil.copy(root / "mjpeg_avi.avi", root / "sub" / "nested.avi")
-        _cache["corpus"] = Corpus(root, skipped)
-    return _cache["corpus"]
+        try:
+            _cache["corpus"] = _build()
+        except (unittest.SkipTest, AssertionError) as problem:
+            _cache["corpus"] = problem
+    result = _cache["corpus"]
+    if isinstance(result, Exception):
+        raise result
+    return result
 
 
 def require(corp, *names):
