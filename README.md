@@ -140,7 +140,8 @@ Output is deterministic: the same inputs give the same bytes (no timestamps).
 | `no_inputs` | error | nothing readable was found |
 | `symlink_skipped` | warning | a link inside a searched folder was not followed (links you name are followed) |
 | `duplicate_content` | warning | identical bytes to another file |
-| `ffprobe_failed`, `ffprobe_timeout`, `ffprobe_output_limit`, `ffprobe_unavailable`, `invalid_probe_json` | error | the file could not be read |
+| `ffprobe_failed`, `ffprobe_timeout`, `ffprobe_output_limit`, `ffprobe_unavailable`, `invalid_probe_json` | error | the file could not be read (`ffprobe_failed` says whether FFprobe exited with an error or crashed) |
+| `ffprobe_optional_sections_skipped` | warning | FFprobe crashed on chapters or programs; a retry with only format and streams succeeded, so `raw` lacks those two sections |
 | `input_changed` | error | the file changed while it was processed; nothing from it is trusted |
 | `video_stream_not_found` | error | no video stream (cover art does not count) |
 | `ffprobe_diagnostic` | warning | text FFprobe printed on stderr |
@@ -173,6 +174,8 @@ file. Estimate a large archive as (total size / 1 GB/s) + (files x 40 ms).
 * Video containers FFmpeg can read. HDF5 and image sequences (also listed by BeStMeta) are not
   read; replace `extract.py` for them (the stages only exchange plain dictionaries).
 * Metadata is read, not verified: files are not decoded.
+* FFprobe itself can crash. A segfault was seen with a static FFmpeg 7.0.2 build on an MPEG-TS file. PyVMM retries
+  once with only `format` and `streams`; if that also fails the file is reported as an error and the run continues.
 * `import.py` is named as requested; `main.py` loads it with `importlib` because `import` is a
   Python keyword. No other module imports it.
 * Verified by the author on Linux: Python 3.11 to 3.14 with FFmpeg 6.1.1, plus FFmpeg 9.0.2 and a static

@@ -37,6 +37,14 @@ def codes(issues):
     return [code for _, code in issues]
 
 
+class CrashDetection(unittest.TestCase):
+    def test_signals_and_windows_error_statuses_are_crashes(self):
+        for code in (-11, -9, -6, 0xC0000005, 0xC0000409, 2**31):
+            self.assertIs(extract._crashed(code), True, code)
+        for code in (0, 1, 2, 69, 255, 2**31 - 1):
+            self.assertIs(extract._crashed(code), False, code)
+
+
 class NumberTests(unittest.TestCase):
     def test_exact_values(self):
         for text, want in (("30000/1001", Fraction(30000, 1001)), ("2.002", Fraction(2002, 1000)),
@@ -314,6 +322,56 @@ class ExtractMetadataTests(TempDirCase):
         self.assertEqual(self.issue_codes(result), [("warning", "ffprobe_diagnostic")])
         self.assertEqual(len(result["issues"][0]["message"]), 1000)
 
+    def test_a_crash_in_the_optional_sections_costs_only_those_sections(self):
+        good = json.dumps({"format": {"format_name": "mpegts"}, "streams": [stream()]}).encode()
+        with mock.patch.object(extract, "_run", side_effect=[(-11, b"", b"segfault"), (0, good, b"")]) as run:
+            result = extract.extract_metadata(self.asset, ffprobe="FFPROBE")
+        first, second = (call.args[0] for call in run.call_args_list)
+        self.assertEqual(first, ["FFPROBE", *extract.PROBE_ARGUMENTS, "-i", str(self.path)])
+        self.assertEqual(second, ["FFPROBE", *extract.CORE_ARGUMENTS, "-i", str(self.path)])
+        for section in ("-show_chapters", "-show_programs"):
+            self.assertNotIn(section, second)
+        self.assertEqual(result["technical"]["width"], 320)
+        self.assertEqual(sorted(result["raw"]), ["format", "streams"])
+        self.assertEqual(self.issue_codes(result), [("warning", "ffprobe_optional_sections_skipped")])
+        self.assertIn("status -11", result["issues"][0]["message"])
+
+    def test_windows_crash_statuses_also_trigger_the_retry(self):
+        good = json.dumps({"streams": [stream()]}).encode()
+        for status in (0xC0000005, 0xC0000409):
+            with self.subTest(hex(status)):
+                with mock.patch.object(extract, "_run", side_effect=[(status, b"", b""), (0, good, b"")]) as run:
+                    result = extract.extract_metadata(self.asset, ffprobe="FFPROBE")
+                self.assertEqual(run.call_count, 2)
+                self.assertEqual(result["technical"]["height"], 240)
+
+    def test_a_crash_that_persists_is_reported_as_the_original_failure(self):
+        with mock.patch.object(extract, "_run", side_effect=[(-11, b"", b""), (-6, b"", b"")]) as run:
+            result = extract.extract_metadata(self.asset, ffprobe="FFPROBE")
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(self.issue_codes(result), [("error", "ffprobe_failed")])
+        self.assertEqual(result["issues"][0]["message"], "FFprobe crashed with status -11.")
+        self.assertEqual((result["raw"], result["technical"]), ({}, {}))
+
+    def test_a_retry_that_fails_normally_keeps_the_original_crash(self):
+        with mock.patch.object(extract, "_run", side_effect=[(-11, b"", b""), (1, b"", b"")]):
+            result = extract.extract_metadata(self.asset, ffprobe="FFPROBE")
+        self.assertEqual(result["issues"][0]["message"], "FFprobe crashed with status -11.")
+
+    def test_a_retry_that_cannot_run_is_reported_with_its_own_code(self):
+        failure = extract.ProbeError("ffprobe_timeout", "took too long")
+        with mock.patch.object(extract, "_run", side_effect=[(-11, b"", b""), failure]):
+            result = extract.extract_metadata(self.asset, ffprobe="FFPROBE")
+        self.assertEqual(self.issue_codes(result), [("error", "ffprobe_timeout")])
+
+    def test_ordinary_failures_are_not_retried(self):
+        for status in (1, 2, 69, 255, 2**31 - 1):
+            with self.subTest(status):
+                with mock.patch.object(extract, "_run", return_value=(status, b"", b"")) as run:
+                    result = extract.extract_metadata(self.asset, ffprobe="FFPROBE")
+                self.assertEqual(run.call_count, 1)
+                self.assertEqual(result["issues"][0]["message"], f"FFprobe exited with status {status}.")
+
     def test_probe_failure_text_reaches_the_issue(self):
         with mock.patch.object(extract, "_run", side_effect=extract.ProbeError("ffprobe_timeout", "took too long")):
             result = extract.extract_metadata(self.asset)
@@ -499,6 +557,17 @@ class FakeProbeTests(TempDirCase):
         self.assertEqual(self.only_issue(result), [("error", "ffprobe_failed")])
         self.assertIn("-11", result["issues"][-1]["message"])
 
+    def test_a_real_crash_in_the_optional_sections_is_survived(self):
+        body = (
+            'case "$*" in *-show_programs*) kill -SEGV $$;; esac\n'
+            'echo \'{"format": {"format_name": "mpegts"}, "streams": [{"index": 0, "codec_type": "video", '
+            '"codec_name": "mpeg2video", "width": 320, "height": 240, "avg_frame_rate": "25/1", '
+            '"r_frame_rate": "25/1", "duration": "1.000000"}]}\''
+        )
+        result = self.extract_with(body)
+        self.assertEqual(result["technical"]["width"], 320)
+        self.assertEqual(self.only_issue(result), [("warning", "ffprobe_optional_sections_skipped")])
+
     def test_garbage_on_success(self):
         result = self.extract_with("echo hello")
         self.assertEqual(self.only_issue(result), [("error", "invalid_probe_json")])
@@ -596,6 +665,7 @@ class OracleTests(TempDirCase):
         for name, (_args, expected, _codec, _container) in support.VIDEOS.items():
             with self.subTest(name):
                 result = self.extract(name)
+                support.skip_if_ffprobe_crashed(result["issues"], name)
                 technical = result["technical"]
                 self.assertEqual([i for i in result["issues"] if i["severity"] == "error"], [])
                 for key, want in expected.items():

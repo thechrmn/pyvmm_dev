@@ -21,10 +21,11 @@ DEMUXERS = (
     "3g2 3gp aac asf avi dv flv h264 hevc ivf m4a m4v matroska mj2 mjpeg mov mp3 mp4 "
     "mpeg mpegts mpegvideo mxf nut ogg wav webm yuv4mpegpipe"
 ).split()
-PROBE_ARGUMENTS = (
+CORE_ARGUMENTS = (  # everything alignment needs; also the fallback if FFprobe crashes on the optional sections
     *("-v", "warning", "-protocol_whitelist", "file", "-format_whitelist", ",".join(DEMUXERS)),
-    *("-print_format", "json", "-show_format", "-show_streams", "-show_chapters", "-show_programs"),
+    *("-print_format", "json", "-show_format", "-show_streams"),
 )
+PROBE_ARGUMENTS = (*CORE_ARGUMENTS, "-show_chapters", "-show_programs")
 _SECTIONS = ("format", "streams", "chapters", "programs")
 _WINDOWS = os.name == "nt"
 # Elementary streams store no timing: FFprobe fills in a default (25 fps) that is not a measurement.
@@ -284,6 +285,27 @@ def _technical(raw, issues, pixel_depths):
     return result
 
 
+def _crashed(code):
+    """True if the process was killed by a signal (negative on POSIX) or died with a Windows error status."""
+    return code < 0 or code >= 2**31
+
+
+def _probe(ffprobe, path, timeout, limit, issues):
+    """Run FFprobe; if it crashes, retry once with the core sections only. Returns (status, stdout, stderr)."""
+    result = _run([ffprobe, *PROBE_ARGUMENTS, "-i", path], timeout, limit)
+    if not _crashed(result[0]):
+        return result
+    retry = _run([ffprobe, *CORE_ARGUMENTS, "-i", path], timeout, limit)
+    if retry[0] != 0:
+        return result  # still failing: the original crash is what gets reported
+    _issue(
+        issues,
+        "ffprobe_optional_sections_skipped",
+        f"FFprobe crashed (status {result[0]}) while reading chapters and programs; they are not reported.",
+    )
+    return retry
+
+
 def _changed(asset):
     try:
         info = Path(asset["path"]).stat()
@@ -296,17 +318,18 @@ def extract_metadata(asset, *, ffprobe="ffprobe", timeout=60, max_output_bytes=M
     """Probe one asset; never raises for bad media, reports problems as issues.
 
     Returns ``{"asset", "raw", "technical", "issues"}``. ``raw`` holds FFprobe's
-    format, streams, chapters and programs unchanged.
+    format, streams, chapters and programs unchanged (chapters and programs are
+    absent if FFprobe crashed on them and a retry without them succeeded).
     """
     issues, raw, technical = [], {}, {}
-    command = [ffprobe, *PROBE_ARGUMENTS, "-i", asset["path"]]
     try:
-        code, output, diagnostic = _run(command, timeout, max_output_bytes)
+        code, output, diagnostic = _probe(ffprobe, asset["path"], timeout, max_output_bytes, issues)
         text = _ADDRESS.sub("", diagnostic.decode("utf-8", errors="replace")).strip()
         if text:
             _issue(issues, "ffprobe_diagnostic", text[:1000])
         if code:
-            _issue(issues, "ffprobe_failed", f"FFprobe exited with status {code}.", "error")
+            how = "crashed with" if _crashed(code) else "exited with"
+            _issue(issues, "ffprobe_failed", f"FFprobe {how} status {code}.", "error")
         else:
             parsed = json.loads(output.decode("utf-8"))
             raw = {key: parsed[key] for key in _SECTIONS if key in parsed}

@@ -256,6 +256,13 @@ def require(corp, *names):
             raise unittest.SkipTest(f"fixture {name} could not be encoded here: {corp.skipped[name]}")
 
 
+def skip_if_ffprobe_crashed(issues, name):
+    """An FFprobe that crashes on valid media is an upstream bug: there is nothing for these tests to judge."""
+    for issue in issues:
+        if issue["code"] == "ffprobe_failed" and "crashed with status" in issue["message"]:
+            raise unittest.SkipTest(f"this FFprobe crashes on {name} ({issue['message']}); upstream bug")
+
+
 def run_main(*argv):
     """Run main.main in-process; return (exit status, stdout, stderr)."""
     out, err = io.StringIO(), io.StringIO()

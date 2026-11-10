@@ -78,6 +78,7 @@ class Oracle(PipelineCase):
             with self.subTest(name):
                 support.require(self.corpus, name)
                 record = self.records[name]
+                support.skip_if_ffprobe_crashed(record["issues"], name)
                 found = acquisition(record)
                 self.assertEqual(error_codes(record), [])
                 self.assertEqual(found["video_resolution_width"], expected["width"])
@@ -248,6 +249,8 @@ class BatchValidity(PipelineCase):
         for name in self.NAMES:
             support.require(self.corpus, name)
         status, stdout, _ = self.run_cli(*[self.corpus.path(n) for n in self.NAMES], "--metadata", self.write_metadata())
+        for record in read_report(self.out())["records"]:
+            support.skip_if_ffprobe_crashed(record["issues"], record["extraction"]["asset"]["relative_path"])
         self.assertEqual(status, 0, self.summary(stdout))
         summary = self.summary(stdout)
         self.assertEqual((summary["files"], summary["valid"], summary["errors"]), (len(self.NAMES), len(self.NAMES), 0))
@@ -472,7 +475,7 @@ class Documentation(unittest.TestCase):
         self.assertEqual(json.loads(block.group(1)), VALID_METADATA)
 
     def test_every_issue_code_the_code_can_raise_is_documented(self):
-        pattern = re.compile(r'(?:_issue\((?:issues,\s*)?|ProbeError\()\s*"([a-z_]+)"')
+        pattern = re.compile(r'(?:_issue\((?:issues,\s*)?|ProbeError\()\s*["\']([a-z_]+)["\']')  # either quote style
         codes = set()
         for name in ("import.py", "extract.py", "align.py"):
             codes |= set(pattern.findall((ROOT / name).read_text(encoding="utf-8")))

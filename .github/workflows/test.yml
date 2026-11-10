@@ -30,4 +30,13 @@ jobs:
           ffmpeg -version | head -n 1
           ffprobe -version | head -n 1
           ffmpeg -hide_banner -encoders | grep -E " (libx264|libx265|libsvtav1|libvpx-vp9|libtheora) " || echo "optional encoders missing: their tests are skipped"
+      - name: FFprobe section diagnostic (informational)
+        shell: bash
+        continue-on-error: true
+        run: |
+          f="$RUNNER_TEMP/diagnostic.ts"
+          ffmpeg -hide_banner -loglevel error -y -f lavfi -i testsrc2=size=320x240:rate=25 -frames:v 25 -c:v mpeg2video -pix_fmt yuv420p "$f"
+          for flags in "-show_format -show_streams -show_chapters -show_programs" "-show_format -show_streams" "-show_programs" "-show_chapters" "-show_streams"; do
+            ffprobe -v warning -print_format json $flags -i "$f" > /dev/null 2>&1 && echo "ok            ffprobe $flags" || echo "FAILED (exit $?) ffprobe $flags"
+          done
       - run: python -W error -m unittest -v

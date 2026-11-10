@@ -22,15 +22,14 @@ from pathlib import Path
 PROJECT = Path(sys.argv[1]).resolve()
 WORKERS = int(sys.argv[2])
 FILES = sys.argv[3:] or ["import.py", "extract.py", "align.py", "export.py", "main.py"]
-LIGHT_EXTRACT = ["tests.test_extract.NumberTests", "tests.test_extract.TechnicalTests",
+LIGHT_EXTRACT = ["tests.test_extract.CrashDetection", "tests.test_extract.NumberTests", "tests.test_extract.TechnicalTests",
                  "tests.test_extract.ExtractMetadataTests", "tests.test_extract.InspectTests"]
-HEAVY_FUNCS = {"_run", "_reap", "_Reader", "inspect_ffprobe", "_component_depths"}
+HEAVY_FUNCS = {"_run", "_reap", "_Reader", "_probe", "_crashed", "inspect_ffprobe", "_component_depths"}
 FAST = {  # tests that exercise a file without needing the ffmpeg corpus
     "import.py": ["tests.test_import"],
     "align.py": ["tests.test_align", "tests.test_export"],
     "export.py": ["tests.test_export"],
-    "extract.py": ["tests.test_extract.NumberTests", "tests.test_extract.TechnicalTests", "tests.test_extract.ExtractMetadataTests",
-                   "tests.test_extract.InspectTests", "tests.test_extract.RunTests", "tests.test_extract.FakeProbeTests"],
+    "extract.py": [*LIGHT_EXTRACT, "tests.test_extract.RunTests", "tests.test_extract.FakeProbeTests"],
     "main.py": ["tests.test_pipeline.ExitStatus"],
 }
 SLOW = {
@@ -176,23 +175,26 @@ if __name__ == "__main__":
     budget = float(os.environ.get("BUDGET", "250"))
     only = os.environ.get("ONLY_SURVIVORS") == "1"
     out = Path(os.environ.get("MUTATION_RESULTS", PROJECT / ".mutation-results.jsonl"))
-    done = {}
-    if out.exists():
-        for entry in out.read_text().splitlines():
-            r = json.loads(entry)
-            done[r["key"]] = r
+
+    def latest():
+        """Verdicts so far: the file is append-only and a later line replaces an earlier one for the same mutant."""
+        found = {}
+        if out.exists():
+            for entry in out.read_text().splitlines():
+                row = json.loads(entry)
+                found[row["key"]] = row
+        return found
+
+    done = latest()
     jobs = []
     for f in FILES:
         tree = ast.parse((PROJECT / f).read_text())
         for desc, line, spec in candidates(tree):
             jobs.append((f, desc, line, spec))
     if only:
-        jobs = [j for j in jobs if done.get(key(j), {}).get("status") == "SURVIVED"]
-        for j in jobs:
-            done.pop(key(j), None)
-        # rewrite the file without the survivors being re-judged
-        out.write_text("".join(json.dumps(r) + "\n" for r in done.values()))
-    todo = [j for j in jobs if key(j) not in done]
+        todo = [j for j in jobs if done.get(key(j), {}).get("status") == "SURVIVED"]
+    else:
+        todo = [j for j in jobs if key(j) not in done]
     print(f"{len(jobs)} mutants, {len(todo)} to run, budget {budget:.0f}s", flush=True)
     t0 = time.time()
     with open(out, "a") as sink:
@@ -205,11 +207,11 @@ if __name__ == "__main__":
             sink.flush()
             if res["status"] == "SURVIVED":
                 print(f"  survived {res['file']}:{res['line']} {res['desc']}", flush=True)
-    results = [json.loads(entry) for entry in out.read_text().splitlines()]
     from collections import Counter
-    mine = [r for r in results if r["file"] in FILES]
+    mine = [r for r in latest().values() if r["file"] in FILES]
     c = Counter(r["status"] for r in mine)
     scored = len(mine) - c["skipped"]
-    remaining = len([j for j in jobs if key(j) not in {r["key"] for r in results}])
+    judged = {r["key"] for r in mine}
+    remaining = len([j for j in jobs if key(j) not in judged])
     killed = c["killed-fast"] + c["killed-full"]
     print(dict(c), f"| judged {len(mine)} | remaining {remaining} | score so far {100 * killed / max(scored, 1):.1f}%", flush=True)
